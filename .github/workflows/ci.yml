@@ -36,6 +36,9 @@ jobs:
       - name: Download modules
         run: go mod download
 
+      - name: Verify chaos launcher entrypoint
+        run: python scripts/chaos_test.py --check-parity
+
       - name: Build all packages
         run: go build ./...
 

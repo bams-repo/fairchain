@@ -171,7 +171,10 @@ var Testnet = &ChainParams{
 	MaxMempoolSize: 5000,
 	MinRelayTxFee:  100,
 
-	SeedNodes: []string{},
+	SeedNodes: []string{
+		"45.32.196.26:19334",  // main_web
+		"207.148.9.169:19334", // mining_pool
+	},
 
 	ActivationHeights: map[string]uint32{},
 }

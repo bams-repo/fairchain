@@ -370,7 +370,7 @@ Add the following to `internal/p2p/manager_test.go`:
 After implementing all fixes, re-run the full chaos test:
 
 ```bash
-bash scripts/chaos_test.sh
+python scripts/chaos_test.py
 ```
 
 Expected results:

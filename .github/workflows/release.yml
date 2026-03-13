@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0-testnet-live.1)"
+        required: true
+      title:
+        description: "Release title"
+        required: true
+        default: "Testnet Live Release"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build release artifacts
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -o dist/fairchain-node-linux-amd64 ./cmd/node
+          GOOS=linux GOARCH=amd64 go build -o dist/fairchain-cli-linux-amd64 ./cmd/cli
+          cp scripts/chaos_test.py dist/chaos_test.py
+          chmod +x dist/fairchain-node-linux-amd64 dist/fairchain-cli-linux-amd64 dist/chaos_test.py
+
+      - name: Create release notes
+        run: |
+          cat > dist/RELEASE_NOTES.md <<'EOF'
+          ## Testnet Live
+
+          Testnet is LIVE and large bounties are available for anyone who can break consensus and provide the exact steps taken so they can be reproduced.
+
+          ## Included Assets
+
+          - `fairchain-node-linux-amd64`
+          - `fairchain-cli-linux-amd64`
+          - `chaos_test.py`
+          EOF
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.event.inputs.tag }}" \
+            --title "${{ github.event.inputs.title }}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            dist/fairchain-node-linux-amd64 \
+            dist/fairchain-cli-linux-amd64 \
+            dist/chaos_test.py

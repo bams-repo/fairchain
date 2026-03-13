@@ -36,7 +36,8 @@ set -uo pipefail
 # Testnet params: 5s target blocks, retarget every 20 blocks.
 #
 # Usage:
-#   bash scripts/chaos_test.sh [--skip PHASES]
+#   python scripts/chaos_test.py [--skip PHASES]
+#   bash scripts/chaos_test.sh [--skip PHASES]   # legacy backend invocation
 #
 #   --skip accepts a comma-separated list of phase IDs or group aliases:
 #     Phase IDs: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,A,B,C,D,E,F,G,H,I,J,K,L,M,16

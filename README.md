@@ -105,6 +105,12 @@ To connect them, add `--seed-peers` or configure `seed_peers` in the config file
 make test
 ```
 
+### Run chaos/adversarial stress test
+
+```bash
+python scripts/chaos_test.py
+```
+
 ## Where to Look First
 
 | Area | Path |
