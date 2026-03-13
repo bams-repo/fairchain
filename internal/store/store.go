@@ -3,6 +3,7 @@ package store
 import (
 	"math/big"
 
+	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
@@ -59,26 +60,7 @@ type PeerStore interface {
 	Close() error
 }
 
-// CalcWork computes the proof-of-work for a given compact target.
+// CalcWork delegates to the canonical crypto.CalcWork implementation.
 func CalcWork(bits uint32) *big.Int {
-	target := compactToBig(bits)
-	if target.Sign() <= 0 {
-		return big.NewInt(0)
-	}
-	// work = 2^256 / (target + 1)
-	maxVal := new(big.Int).Lsh(big.NewInt(1), 256)
-	denom := new(big.Int).Add(target, big.NewInt(1))
-	return new(big.Int).Div(maxVal, denom)
-}
-
-func compactToBig(compact uint32) *big.Int {
-	exponent := compact >> 24
-	mantissa := compact & 0x007fffff
-	if exponent <= 3 {
-		mantissa >>= 8 * (3 - exponent)
-		return big.NewInt(int64(mantissa))
-	}
-	bn := big.NewInt(int64(mantissa))
-	bn.Lsh(bn, uint(8*(exponent-3)))
-	return bn
+	return crypto.CalcWork(bits)
 }

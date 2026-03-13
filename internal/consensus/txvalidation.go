@@ -77,6 +77,10 @@ func ValidateTransactionInputs(block *types.Block, utxoSet *utxo.Set, height uin
 			}
 
 			if entry.IsCoinbase {
+				if height < entry.Height {
+					return 0, fmt.Errorf("tx %s input %d: coinbase at height %d cannot be spent at height %d",
+						txHash, inIdx, entry.Height, height)
+				}
 				maturityDepth := height - entry.Height
 				if maturityDepth < p.CoinbaseMaturity {
 					return 0, fmt.Errorf("tx %s input %d: coinbase output at height %d not mature (need %d confirmations, have %d)",
@@ -173,6 +177,10 @@ func ValidateSingleTransaction(tx *types.Transaction, utxoSet *utxo.Set, tipHeig
 		}
 
 		if entry.IsCoinbase {
+			if spendHeight < entry.Height {
+				return 0, fmt.Errorf("tx %s input %d: coinbase at height %d cannot be spent at height %d",
+					txHash, inIdx, entry.Height, spendHeight)
+			}
 			maturityDepth := spendHeight - entry.Height
 			if maturityDepth < p.CoinbaseMaturity {
 				return 0, fmt.Errorf("tx %s input %d: coinbase output at height %d not mature (need %d, have %d)",

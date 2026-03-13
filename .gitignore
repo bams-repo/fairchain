@@ -28,6 +28,9 @@ data/
 # Temporary test data
 /tmp/
 
+# Chaos test run data (sequential runs)
+chaos-runs/
+
 # Environment / secrets
 .env
 *.pem

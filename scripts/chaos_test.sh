@@ -2,11 +2,11 @@
 set -uo pipefail
 
 # ==========================================================================
-# FAIRCHAIN 10-NODE CHAOS + ADVERSARIAL + CONSENSUS STRESS TEST
+# FAIRCHAIN 12-NODE CHAOS + ADVERSARIAL + CONSENSUS STRESS TEST
 #
 # Architecture (mirrors real networks):
-#   Nodes 0,1  = SEED nodes (relay-only, no mining — network backbone)
-#   Nodes 2-9  = MINER nodes (connect to seeds, subject to chaos)
+#   Nodes 0,1   = SEED nodes (relay-only, no mining — network backbone)
+#   Nodes 2-11  = MINER nodes (connect to seeds, subject to chaos)
 #
 # Phases 0-9:  Network chaos (kill/restart nodes, seed swaps, partitions)
 # Phases 10-15: Adversarial attacks against the RPC submitblock endpoint:
@@ -51,6 +51,7 @@ set -uo pipefail
 # ==========================================================================
 
 # ── Phase skip support ───────────────────────────────────────
+ORIG_ARGS="$*"
 SKIP_LIST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -107,15 +108,44 @@ if [ ! -x "$ADV" ]; then
     echo "[chaos] adversary binary not found, building..."
     (cd "$PROJROOT" && go build -o bin/fairchain-adversary ./cmd/adversary)
 fi
-BASEDIR="/tmp/fairchain-chaos"
-NUM_NODES=10
+
+# ── Sequential run directory ───────────────────────────────
+RUNS_ROOT="${PROJROOT}/chaos-runs"
+mkdir -p "$RUNS_ROOT"
+
+LAST_RUN=$(ls -1d "$RUNS_ROOT"/run-[0-9][0-9][0-9] 2>/dev/null | sort -V | tail -1 | grep -oP '\d{3}$' || echo "000")
+NEXT_RUN=$(printf "%03d" $((10#$LAST_RUN + 1)))
+RUN_DIR="${RUNS_ROOT}/run-${NEXT_RUN}"
+mkdir -p "$RUN_DIR"
+
+ln -sfn "$RUN_DIR" "${RUNS_ROOT}/latest"
+
+BASEDIR="${RUN_DIR}/nodes"
+RUN_LOG="${RUN_DIR}/chaos_test.log"
+
+NUM_NODES=12
 SEED_NODES=(0 1)
-MINER_NODES=(2 3 4 5 6 7 8 9)
+MINER_NODES=($(seq 2 11))
 BASE_P2P_PORT=30000
 BASE_RPC_PORT=31000
 PIDS=()
 
 SEED_ADDRS="127.0.0.1:$((BASE_P2P_PORT + 0)),127.0.0.1:$((BASE_P2P_PORT + 1))"
+
+NUM_SEEDS=${#SEED_NODES[@]}
+NUM_MINERS=${#MINER_NODES[@]}
+
+pick_random_miners() {
+    local count=$1
+    local pool=("${MINER_NODES[@]}")
+    local picked=()
+    for ((n=0; n<count && ${#pool[@]}>0; n++)); do
+        local idx=$((RANDOM % ${#pool[@]}))
+        picked+=("${pool[$idx]}")
+        pool=("${pool[@]:0:$idx}" "${pool[@]:$((idx+1))}")
+    done
+    echo "${picked[@]}"
+}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -130,14 +160,39 @@ fail()  { echo -e "${RED}[FAIL]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 header(){ echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 
+# ── Write run metadata ─────────────────────────────────────
+cat > "${RUN_DIR}/meta.txt" <<METAEOF
+run:        ${NEXT_RUN}
+started:    $(date -Iseconds)
+hostname:   $(hostname)
+args:       $0 ${ORIG_ARGS:-}
+skip_list:  ${SKIP_LIST:-<none>}
+num_nodes:  ${NUM_NODES}
+num_seeds:  ${NUM_SEEDS}
+num_miners: ${NUM_MINERS}
+basedir:    ${BASEDIR}
+run_dir:    ${RUN_DIR}
+METAEOF
+
+# ── Auto-tee all output into the run log ───────────────────
+exec > >(tee -a "$RUN_LOG") 2>&1
+
 cleanup() {
     log "Cleaning up all nodes..."
     for i in $(seq 0 $((NUM_NODES - 1))); do
         kill "${PIDS[$i]:-}" 2>/dev/null || true
     done
     sleep 2
-    pkill -9 -f "fairchain-node.*fairchain-chaos" 2>/dev/null || true
+    pkill -9 -f "fairchain-node.*chaos-runs" 2>/dev/null || true
     sleep 1
+    echo ""
+    echo "finished:   $(date -Iseconds)" >> "${RUN_DIR}/meta.txt"
+    echo "exit_code:  ${FAILURES}" >> "${RUN_DIR}/meta.txt"
+    log "Run data preserved in: ${RUN_DIR}"
+    log "  Node data:  ${BASEDIR}/node*/  (data dirs + stdout.log per node)"
+    log "  Script log: ${RUN_LOG}"
+    log "  Metadata:   ${RUN_DIR}/meta.txt"
+    log "  Latest:     ${RUNS_ROOT}/latest -> run-${NEXT_RUN}"
 }
 trap cleanup EXIT
 
@@ -513,10 +568,12 @@ run_check() { if ! "$@"; then ((FAILURES++)); fi; }
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-echo " FAIRCHAIN 10-NODE CHAOS + ADVERSARIAL + CONSENSUS STRESS TEST"
-echo " 2 Seeds + 8 Miners · 5s blocks · retarget/20"
+echo " FAIRCHAIN ${NUM_NODES}-NODE CHAOS + ADVERSARIAL + CONSENSUS STRESS TEST"
+echo " ${NUM_SEEDS} Seeds + ${NUM_MINERS} Miners · 5s blocks · retarget/20"
 echo " Phases 0-9: Chaos | 10-15: Adversarial | A-H: Consensus"
 echo " Phases I-M: UTXO Validation | 16: Final Verification"
+echo "────────────────────────────────────────────────────────────────────"
+echo -e " Run #${NEXT_RUN}  ·  ${RUN_DIR}"
 echo "════════════════════════════════════════════════════════════════════"
 if [ -n "$EXPANDED_SKIP" ]; then
     echo -e " ${YELLOW}Skipping phases: ${EXPANDED_SKIP}${NC}"
@@ -532,12 +589,13 @@ mkdir -p "$BASEDIR"
 # ── Phase 1: Launch seed nodes (relay-only, no mining) ──────
 # Phase 1 always runs — it starts the cluster.
 header "Phase 1a: Launch Seed Nodes (relay-only)"
-start_node 0 false
-start_node 1 false
+for i in "${SEED_NODES[@]}"; do
+    start_node "$i" false
+done
 log "Waiting 4s for seeds to peer with each other..."
 sleep 4
 
-header "Phase 1b: Launch Miner Nodes"
+header "Phase 1b: Launch Miner Nodes (${NUM_MINERS} miners)"
 for i in "${MINER_NODES[@]}"; do
     start_node "$i" true
     sleep 0.2
@@ -559,45 +617,48 @@ run_check check_retarget
 fi
 
 if ! should_skip "3"; then
-# ── Phase 3: Kill 3 miner nodes ────────────────────────────
-header "Phase 3: CHAOS — Kill miners 3, 5, 7"
-stop_node 3; stop_node 5; stop_node 7
+# ── Phase 3: Kill ~30% of miners ────────────────────────────
+PHASE3_KILL_COUNT=$((NUM_MINERS * 3 / 10))
+PHASE3_VICTIMS=($(pick_random_miners $PHASE3_KILL_COUNT))
+header "Phase 3: CHAOS — Kill $PHASE3_KILL_COUNT miners"
+for i in "${PHASE3_VICTIMS[@]}"; do stop_node "$i"; done
 sleep 2
-print_cluster_status "After Killing 3 Miners"
+print_cluster_status "After Killing $PHASE3_KILL_COUNT Miners"
 
 log "Letting survivors mine for 20s..."
 sleep 20
 
 wait_for_convergence 20 "Phase 3 survivors"
 print_cluster_status "Survivors Mining"
-run_check check_consensus "Phase 3 (5 miners + 2 seeds)"
+run_check check_consensus "Phase 3 ($((NUM_MINERS - PHASE3_KILL_COUNT)) miners + ${NUM_SEEDS} seeds)"
 fi
 
 if ! should_skip "4"; then
 # ── Phase 4: Restart killed miners (fresh sync) ────────────
 header "Phase 4: Restart Killed Miners (fresh sync from seeds)"
-for i in 3 5 7; do
+for i in "${PHASE3_VICTIMS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
+    sleep 0.1
 done
 
 log "Waiting for restarted miners to sync and converge..."
 wait_for_convergence 45 "Phase 4 sync" 3
 print_cluster_status "After Restart & Sync"
-run_check check_consensus "Phase 4 (all 10)"
+run_check check_consensus "Phase 4 (all ${NUM_NODES})"
 fi
 
 if ! should_skip "5"; then
 # ── Phase 5: Kill one seed ──────────────────────────────────
-header "Phase 5: CHAOS — Kill SEED 0 (network runs on single seed)"
+header "Phase 5: CHAOS — Kill SEED 0 (network runs on ${NUM_SEEDS}-1 seeds)"
 stop_node 0
 sleep 2
-log "Running with 1 seed for 20s..."
+log "Running with $((NUM_SEEDS - 1)) seed for 20s..."
 sleep 20
 
 wait_for_convergence 20 "Phase 5"
 print_cluster_status "One Seed Down"
-run_check check_consensus "Phase 5 (1 seed)"
+run_check check_consensus "Phase 5 ($((NUM_SEEDS - 1)) seeds)"
 fi
 
 if ! should_skip "6"; then
@@ -618,39 +679,43 @@ fi
 
 if ! should_skip "7"; then
 # ── Phase 7: Restore seed 1, kill majority of miners ───────
-header "Phase 7: Restore seed 1, kill 5 miners (2,4,6,8,9)"
+PHASE7_KILL_COUNT=$((NUM_MINERS * 6 / 10))
+PHASE7_VICTIMS=($(pick_random_miners $PHASE7_KILL_COUNT))
+PHASE7_SURVIVORS=$((NUM_MINERS - PHASE7_KILL_COUNT + NUM_SEEDS))
+header "Phase 7: Restore seed 1, kill $PHASE7_KILL_COUNT miners"
 rm -rf "${BASEDIR}/node1"
 start_node 1 false
 sleep 3
-for i in 2 4 6 8 9; do stop_node "$i"; done
+for i in "${PHASE7_VICTIMS[@]}"; do stop_node "$i"; done
 sleep 2
 
-log "Minority (seeds + miners 3,5,7) mining for 20s..."
+log "Minority (${NUM_SEEDS} seeds + $((NUM_MINERS - PHASE7_KILL_COUNT)) miners) mining for 20s..."
 sleep 20
 
 wait_for_convergence 20 "Phase 7 minority"
 print_cluster_status "Minority Mining"
-run_check check_consensus "Phase 7 (5 nodes)"
+run_check check_consensus "Phase 7 ($PHASE7_SURVIVORS nodes)"
 fi
 
 if ! should_skip "8"; then
 # ── Phase 8: Restore all miners ────────────────────────────
 header "Phase 8: Restore all killed miners (fresh sync)"
-for i in 2 4 6 8 9; do
+for i in "${PHASE7_VICTIMS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
-    sleep 0.2
+    sleep 0.1
 done
 
 wait_for_convergence 60 "Phase 8 full restore" 3
 print_cluster_status "Full Restoration"
-run_check check_consensus "Phase 8 (all 10)"
+run_check check_consensus "Phase 8 (all ${NUM_NODES})"
 fi
 
 if ! should_skip "9"; then
 # ── Phase 9: Rapid kill/restart chaos ──────────────────────
-header "Phase 9: CHAOS — Rapid kill/restart (5 rounds, miners only)"
-for round in $(seq 1 5); do
+PHASE9_ROUNDS=5
+header "Phase 9: CHAOS — Rapid kill/restart ($PHASE9_ROUNDS rounds, miners only)"
+for round in $(seq 1 $PHASE9_ROUNDS); do
     victim=${MINER_NODES[$((RANDOM % ${#MINER_NODES[@]}))]}
     log "  Round $round: kill miner $victim"
     stop_node "$victim"
@@ -667,8 +732,8 @@ run_check check_consensus "Phase 9"
 fi
 
 # ── Adversary helper (always defined, used by multiple phases) ──
-SEED_RPC="http://127.0.0.1:$((BASE_RPC_PORT + 0))"
-MINER_RPC="http://127.0.0.1:$((BASE_RPC_PORT + 2))"
+SEED_RPC="http://127.0.0.1:$((BASE_RPC_PORT + ${SEED_NODES[0]}))"
+MINER_RPC="http://127.0.0.1:$((BASE_RPC_PORT + ${MINER_NODES[0]}))"
 
 adversary_check() {
     local label=$1
@@ -846,31 +911,38 @@ if ! should_skip "D"; then
 # ── Phase D: Deep Reorg Resilience ─────────────────────────
 header "Phase D: CONSENSUS — Deep reorg resilience (partitioned mining)"
 
-log "Creating partition: miners 2,3,4 isolated from miners 5,6,7,8,9..."
-for i in 5 6 7 8 9; do stop_node "$i"; done
+PART_A_SIZE=$((NUM_MINERS * 4 / 10))
+PART_B_SIZE=$((NUM_MINERS - PART_A_SIZE))
+PART_A_MINERS=("${MINER_NODES[@]:0:$PART_A_SIZE}")
+PART_B_MINERS=("${MINER_NODES[@]:$PART_A_SIZE}")
+
+log "Creating partition: ${PART_A_SIZE} miners (A) isolated from ${PART_B_SIZE} miners (B)..."
+for i in "${PART_B_MINERS[@]}"; do stop_node "$i"; done
 sleep 2
 
-log "Partition A (miners 2,3,4 + seeds) mining for 25s..."
+log "Partition A (${PART_A_SIZE} miners + seeds) mining for 25s..."
 sleep 25
-PARTITION_A_HEIGHT=$(get_height "$((BASE_RPC_PORT + 2))")
+PARTITION_A_HEIGHT=$(get_height "$((BASE_RPC_PORT + ${PART_A_MINERS[0]}))")
 log "  Partition A height: $PARTITION_A_HEIGHT"
 
-for i in 2 3 4; do stop_node "$i"; done
+for i in "${PART_A_MINERS[@]}"; do stop_node "$i"; done
 sleep 1
 
-for i in 5 6 7 8 9; do
+for i in "${PART_B_MINERS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
+    sleep 0.1
 done
 
-log "Partition B (miners 5-9 + seeds) syncing and mining for 30s..."
+log "Partition B (${PART_B_SIZE} miners + seeds) syncing and mining for 30s..."
 sleep 30
-PARTITION_B_HEIGHT=$(get_height "$((BASE_RPC_PORT + 5))")
+PARTITION_B_HEIGHT=$(get_height "$((BASE_RPC_PORT + ${PART_B_MINERS[0]}))")
 log "  Partition B height: $PARTITION_B_HEIGHT"
 
-for i in 2 3 4; do
+for i in "${PART_A_MINERS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
+    sleep 0.1
 done
 
 log "Reconnecting all miners — expecting convergence via reorg..."
@@ -1077,6 +1149,10 @@ if [ "$FAILURES" -eq 0 ]; then
 else
     echo -e " ${RED}$FAILURES CHECK(S) FAILED${NC}"
 fi
+echo "────────────────────────────────────────────────────────────────────"
+echo " Run #${NEXT_RUN} data preserved in: ${RUN_DIR}"
+echo " Node logs: ${BASEDIR}/node*/stdout.log"
+echo " Full log:  ${RUN_LOG}"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 

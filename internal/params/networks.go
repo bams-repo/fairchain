@@ -6,35 +6,87 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
+const (
+	// Base-unit representation of ~20,999,999.9769 coin cap.
+	baseMaxSupply = 2_099_999_997_690_000
+
+	// 20% premine on top of mined supply for testnet.
+	testnetPremineAmount = baseMaxSupply / 5
+)
+
+var (
+	// Hardcoded burn marker script for trackable burns/premine accounting.
+	// NOTE: Script spend rules are not enforced yet in this codebase.
+	testnetBurnScript = []byte("burn:testnet:premine:v1")
+)
+
 // Mainnet is the primary fairchain network.
 // Economic parameters are aligned with Bitcoin mainnet.
-// Genesis block will be mined with the genesis tool before launch.
 var Mainnet = &ChainParams{
 	Name:         "mainnet",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x01},
 	DefaultPort:  19333,
 	AddressPrefix: 0x00,
 
+	// Pre-mined genesis block.
+	// Coinbase: "fairchain mainnet genesis"
+	// Timestamp: 1773212462 (2026-03-08T23:41:02Z)
+	// Display hash: 00000db0edab82e820ef5c8c7a12ceb8ec6639e3110457a1cee156361fb87054
+	GenesisBlock: types.Block{
+		Header: types.BlockHeader{
+			Version:   1,
+			PrevBlock: types.ZeroHash,
+			MerkleRoot: types.Hash{
+				0x1a, 0x43, 0xdf, 0x3e, 0xf8, 0x14, 0x0d, 0xbe,
+				0x47, 0xad, 0xea, 0xdb, 0x14, 0x1b, 0xd4, 0xbb,
+				0x74, 0xee, 0x7d, 0x6f, 0x81, 0x44, 0x1c, 0x4d,
+				0xc0, 0x41, 0x16, 0xf1, 0xb5, 0x01, 0xdc, 0xb5,
+			},
+			Timestamp: 1773212462,
+			Bits:      0x1e0fffff,
+			Nonce:     433076,
+		},
+		Transactions: []types.Transaction{{
+			Version: 1,
+			Inputs: []types.TxInput{{
+				PreviousOutPoint: types.CoinbaseOutPoint,
+				SignatureScript:  []byte("fairchain mainnet genesis"),
+				Sequence:         0xFFFFFFFF,
+			}},
+			Outputs: []types.TxOutput{{
+				Value:    50_0000_0000,
+				PkScript: []byte{0x00},
+			}},
+			LockTime: 0,
+		}},
+	},
+	GenesisHash: types.Hash{
+		0x54, 0x70, 0xb8, 0x1f, 0x36, 0x56, 0xe1, 0xce,
+		0xa1, 0x57, 0x04, 0x11, 0xe3, 0x39, 0x66, 0xec,
+		0xb8, 0xce, 0x12, 0x7a, 0x8c, 0x5c, 0xef, 0x20,
+		0xe8, 0x82, 0xab, 0xed, 0xb0, 0x0d, 0x00, 0x00,
+	},
+
 	TargetBlockSpacing:  10 * time.Minute,
-	RetargetInterval:    144,                             // Difficulty adjustment every 144 blocks (~24 hours at 10-min blocks).
-	TargetTimespan:      144 * 10 * time.Minute,          // 144 blocks * 10 min = 1,440 min (24 hours).
+	RetargetInterval:    144,
+	TargetTimespan:      144 * 10 * time.Minute,
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	InitialBits:      0x1d00ffff,
-	MinBits:          0x1e0fffff, // Easier than initial — allows recovery from catastrophic hash rate loss.
+	InitialBits:      0x1e0fffff,
+	MinBits:          0x1e0fffff,
 	NoRetarget:       false,
 
 	MaxBlockSize:     1_000_000,
 	MaxBlockTxCount:  10_000,
 
-	InitialSubsidy:          50_0000_0000, // 50 coins * 10^8 smallest units.
-	SubsidyHalvingInterval:  210_000,      // ~4 years at 10-min blocks (210,000 * 10 min ≈ 3.99 years).
+	InitialSubsidy:          50_0000_0000,
+	SubsidyHalvingInterval:  210_000,
 
 	CoinbaseMaturity: 100,
 
 	MaxMempoolSize: 5000,
-	MinRelayTxFee:  1000, // Smallest units per tx — equivalent to Bitcoin's 1000 sat minimum relay fee.
+	MinRelayTxFee:  1000,
 
 	SeedNodes: []string{},
 
@@ -51,20 +103,20 @@ var Testnet = &ChainParams{
 	// Pre-mined genesis block.
 	// Coinbase: "fairchain testnet genesis"
 	// Timestamp: 1773212867 (2026-03-11T07:07:47Z)
-	// Display hash: 000005ab078d150cbdb55eb5147c1b2d935ea71a0e19e66f249577275f1b82e2
+	// Display hash: 000008559ecc2476f6f26b3367f2935d9976f58a6a6cbcff62df26f1f2861097
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
 			PrevBlock: types.ZeroHash,
 			MerkleRoot: types.Hash{
-				0xb7, 0xa4, 0x2f, 0x81, 0x4d, 0x96, 0xb8, 0x12,
-				0x21, 0xc0, 0x76, 0xa7, 0xe1, 0xae, 0xee, 0x4b,
-				0xd6, 0xf8, 0xdf, 0xb1, 0x39, 0x92, 0xaf, 0x06,
-				0x07, 0xeb, 0xef, 0xe9, 0x87, 0x77, 0xd6, 0x55,
+				0xb5, 0x8a, 0xb7, 0x94, 0xe8, 0x13, 0x5d, 0x55,
+				0xf9, 0x7b, 0x93, 0x7f, 0xbb, 0x19, 0xca, 0xa3,
+				0xe4, 0x3b, 0xd0, 0x3f, 0xe6, 0x0b, 0x4e, 0x08,
+				0x19, 0x0a, 0xf5, 0x44, 0x52, 0xce, 0xd2, 0x3a,
 			},
 			Timestamp: 1773212867,
 			Bits:      0x1e0fffff,
-			Nonce:     206896,
+			Nonce:     912710,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -73,18 +125,24 @@ var Testnet = &ChainParams{
 				SignatureScript:  []byte("fairchain testnet genesis"),
 				Sequence:         0xFFFFFFFF,
 			}},
-			Outputs: []types.TxOutput{{
-				Value:    50_0000_0000,
-				PkScript: []byte{0x00},
-			}},
+			Outputs: []types.TxOutput{
+				{
+					Value:    50_0000_00,
+					PkScript: []byte{0x00},
+				},
+				{
+					Value:    testnetPremineAmount,
+					PkScript: testnetBurnScript,
+				},
+			},
 			LockTime: 0,
 		}},
 	},
 	GenesisHash: types.Hash{
-		0xe2, 0x82, 0x1b, 0x5f, 0x27, 0x77, 0x95, 0x24,
-		0x6f, 0xe6, 0x19, 0x0e, 0x1a, 0xa7, 0x5e, 0x93,
-		0x2d, 0x1b, 0x7c, 0x14, 0xb5, 0x5e, 0xb5, 0xbd,
-		0x0c, 0x15, 0x8d, 0x07, 0xab, 0x05, 0x00, 0x00,
+		0x97, 0x10, 0x86, 0xf2, 0xf1, 0x26, 0xdf, 0x62,
+		0xff, 0xbc, 0x6c, 0x6a, 0x8a, 0xf5, 0x76, 0x99,
+		0x5d, 0x93, 0xf2, 0x67, 0x33, 0x6b, 0xf2, 0xf6,
+		0x76, 0x24, 0xcc, 0x9e, 0x55, 0x08, 0x00, 0x00,
 	},
 
 	TargetBlockSpacing:  5 * time.Second,
@@ -100,8 +158,13 @@ var Testnet = &ChainParams{
 	MaxBlockSize:     2_000_000,
 	MaxBlockTxCount:  10_000,
 
-	InitialSubsidy:          50_0000_0000,
-	SubsidyHalvingInterval:  210_000,
+	// Economic scaling: testnet is 100x block-height accelerated relative to
+	// mainnet for issuance comparisons (e.g., testnet 100,000 ~= mainnet 1,000).
+	// To keep monetary state aligned by that mapping:
+	//   - per-block subsidy is 1/100 of mainnet
+	//   - halving interval is 100x mainnet
+	InitialSubsidy:          50_0000_00,
+	SubsidyHalvingInterval:  21_000_000,
 
 	CoinbaseMaturity: 10,
 

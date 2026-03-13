@@ -50,7 +50,7 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 	t.Cleanup(func() { s.Close() })
 
 	engine := pow.New()
-	c := chain.New(p, engine, s)
+	c := chain.New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
 	}

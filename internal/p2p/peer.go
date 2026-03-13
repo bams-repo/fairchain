@@ -63,10 +63,39 @@ func (p *Peer) Addr() string { return p.addr }
 func (p *Peer) IsInbound() bool { return p.inbound }
 
 // Version returns the peer's version message (nil if handshake not complete).
-func (p *Peer) Version() *protocol.VersionMsg { return p.version }
+func (p *Peer) Version() *protocol.VersionMsg {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.version == nil {
+		return nil
+	}
+	v := *p.version
+	return &v
+}
 
 // SetVersion stores the peer's version info after handshake.
-func (p *Peer) SetVersion(v *protocol.VersionMsg) { p.version = v }
+func (p *Peer) SetVersion(v *protocol.VersionMsg) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v == nil {
+		p.version = nil
+		return
+	}
+	cp := *v
+	p.version = &cp
+}
+
+// SetStartHeightIfGreater updates the peer's advertised height monotonically.
+func (p *Peer) SetStartHeightIfGreater(height uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.version == nil {
+		return
+	}
+	if height > p.version.StartHeight {
+		p.version.StartHeight = height
+	}
+}
 
 // AddKnownInventory marks an inventory item as known by this peer.
 func (p *Peer) AddKnownInventory(hash types.Hash) {

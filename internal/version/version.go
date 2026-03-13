@@ -7,7 +7,7 @@ const (
 	Major = 0
 
 	// Minor is the minor version component (new features, backward-compatible).
-	Minor = 1
+	Minor = 2
 
 	// Patch is the patch version component (bug fixes).
 	Patch = 0

@@ -86,6 +86,7 @@ func PutVarInt(buf []byte, val uint64) int {
 }
 
 // ReadVarInt reads a variable-length integer from r.
+// Rejects non-canonical (non-minimal) encodings to prevent malleability.
 func ReadVarInt(r io.Reader) (uint64, error) {
 	var discriminant [1]byte
 	if _, err := io.ReadFull(r, discriminant[:]); err != nil {
@@ -97,25 +98,38 @@ func ReadVarInt(r io.Reader) (uint64, error) {
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return 0, err
 		}
-		return uint64(binary.LittleEndian.Uint16(buf[:])), nil
+		val := uint64(binary.LittleEndian.Uint16(buf[:]))
+		if val < 0xFD {
+			return 0, fmt.Errorf("non-canonical varint: 0xFD used for value %d", val)
+		}
+		return val, nil
 	case 0xFE:
 		var buf [4]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return 0, err
 		}
-		return uint64(binary.LittleEndian.Uint32(buf[:])), nil
+		val := uint64(binary.LittleEndian.Uint32(buf[:]))
+		if val <= 0xFFFF {
+			return 0, fmt.Errorf("non-canonical varint: 0xFE used for value %d", val)
+		}
+		return val, nil
 	case 0xFF:
 		var buf [8]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return 0, err
 		}
-		return binary.LittleEndian.Uint64(buf[:]), nil
+		val := binary.LittleEndian.Uint64(buf[:])
+		if val <= 0xFFFFFFFF {
+			return 0, fmt.Errorf("non-canonical varint: 0xFF used for value %d", val)
+		}
+		return val, nil
 	default:
 		return uint64(discriminant[0]), nil
 	}
 }
 
 // ReadVarIntFromBytes reads a varint from a byte slice without an io.Reader.
+// Rejects non-canonical (non-minimal) encodings to prevent malleability.
 func ReadVarIntFromBytes(data []byte) (uint64, error) {
 	if len(data) == 0 {
 		return 0, fmt.Errorf("empty data for varint")
@@ -125,17 +139,29 @@ func ReadVarIntFromBytes(data []byte) (uint64, error) {
 		if len(data) < 3 {
 			return 0, fmt.Errorf("varint 0xFD needs 3 bytes, got %d", len(data))
 		}
-		return uint64(binary.LittleEndian.Uint16(data[1:3])), nil
+		val := uint64(binary.LittleEndian.Uint16(data[1:3]))
+		if val < 0xFD {
+			return 0, fmt.Errorf("non-canonical varint: 0xFD used for value %d", val)
+		}
+		return val, nil
 	case 0xFE:
 		if len(data) < 5 {
 			return 0, fmt.Errorf("varint 0xFE needs 5 bytes, got %d", len(data))
 		}
-		return uint64(binary.LittleEndian.Uint32(data[1:5])), nil
+		val := uint64(binary.LittleEndian.Uint32(data[1:5]))
+		if val <= 0xFFFF {
+			return 0, fmt.Errorf("non-canonical varint: 0xFE used for value %d", val)
+		}
+		return val, nil
 	case 0xFF:
 		if len(data) < 9 {
 			return 0, fmt.Errorf("varint 0xFF needs 9 bytes, got %d", len(data))
 		}
-		return binary.LittleEndian.Uint64(data[1:9]), nil
+		val := binary.LittleEndian.Uint64(data[1:9])
+		if val <= 0xFFFFFFFF {
+			return 0, fmt.Errorf("non-canonical varint: 0xFF used for value %d", val)
+		}
+		return val, nil
 	default:
 		return uint64(data[0]), nil
 	}

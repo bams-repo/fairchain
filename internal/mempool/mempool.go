@@ -181,8 +181,19 @@ func (m *Mempool) removeTxUnsafe(hash types.Hash) {
 	delete(m.txs, hash)
 }
 
-// GetAll returns all transactions ordered by fee rate (highest first) for block template building.
-func (m *Mempool) GetAll() []*types.Transaction {
+// BlockTemplateResult holds an atomic snapshot of mempool transactions and their
+// aggregate fees, suitable for block template construction. This mirrors Bitcoin
+// Core's BlockAssembler which snapshots the mempool under a single lock.
+type BlockTemplateResult struct {
+	Transactions []*types.Transaction
+	TotalFees    uint64
+}
+
+// BlockTemplate returns an atomic snapshot of all mempool transactions and their
+// total fees under a single lock acquisition. This prevents the TOCTOU race
+// where transactions could be added between separate GetAll/TotalFees calls,
+// which would cause the coinbase to claim fees for transactions not in the block.
+func (m *Mempool) BlockTemplate() *BlockTemplateResult {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -198,11 +209,18 @@ func (m *Mempool) GetAll() []*types.Transaction {
 		return hashLess(entries[i].Hash, entries[j].Hash)
 	})
 
+	var totalFees uint64
 	txs := make([]*types.Transaction, len(entries))
 	for i, e := range entries {
 		txs[i] = e.Tx
+		totalFees += e.Fee
 	}
-	return txs
+	return &BlockTemplateResult{Transactions: txs, TotalFees: totalFees}
+}
+
+// GetAll returns all transactions ordered by fee rate (highest first) for block template building.
+func (m *Mempool) GetAll() []*types.Transaction {
+	return m.BlockTemplate().Transactions
 }
 
 // GetAllEntries returns all mempool entries with metadata, ordered by fee rate.

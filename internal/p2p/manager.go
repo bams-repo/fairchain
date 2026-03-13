@@ -23,6 +23,11 @@ import (
 	"github.com/bams-repo/fairchain/internal/version"
 )
 
+// TimeSampler accepts peer clock samples for network-adjusted time.
+type TimeSampler interface {
+	AddSample(addr string, peerTime int64)
+}
+
 // Manager handles peer connections, handshakes, and message routing.
 type Manager struct {
 	params      *params.ChainParams
@@ -33,21 +38,87 @@ type Manager struct {
 	maxInbound  int
 	maxOutbound int
 	seedPeers   []string
+	timeSampler TimeSampler
 
 	mu             sync.RWMutex
 	peers          map[string]*Peer
 	localNonce     uint64
 	bestPeerHeight uint32
 
-	// Seen inventory caches to prevent rebroadcast storms.
-	seenBlocks sync.Map // types.Hash -> struct{}
-	seenTxs    sync.Map // types.Hash -> struct{}
+	seenBlocks *boundedHashSet
+	seenTxs    *boundedHashSet
 
 	listener net.Listener
 }
 
-// NewManager creates a new P2P manager.
-func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps store.PeerStore, listenAddr string, maxIn, maxOut int, seeds []string) *Manager {
+const (
+	maxSeenBlocks = 10000
+	maxSeenTxs    = 50000
+)
+
+// boundedHashSet is a bounded set of hashes with FIFO eviction, modeled after
+// Bitcoin Core's CRollingBloomFilter used for inventory deduplication.
+type boundedHashSet struct {
+	mu    sync.Mutex
+	items map[types.Hash]struct{}
+	order []types.Hash
+	cap   int
+}
+
+func newBoundedHashSet(capacity int) *boundedHashSet {
+	return &boundedHashSet{
+		items: make(map[types.Hash]struct{}, capacity),
+		order: make([]types.Hash, 0, capacity),
+		cap:   capacity,
+	}
+}
+
+func (s *boundedHashSet) Add(h types.Hash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.items[h]; ok {
+		return
+	}
+	if len(s.items) >= s.cap {
+		evict := s.order[0]
+		s.order = s.order[1:]
+		delete(s.items, evict)
+	}
+	s.items[h] = struct{}{}
+	s.order = append(s.order, h)
+}
+
+func (s *boundedHashSet) Has(h types.Hash) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.items[h]
+	return ok
+}
+
+func (s *boundedHashSet) AddOrHas(h types.Hash) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.items[h]; ok {
+		return true
+	}
+	if len(s.items) >= s.cap {
+		evict := s.order[0]
+		s.order = s.order[1:]
+		delete(s.items, evict)
+	}
+	s.items[h] = struct{}{}
+	s.order = append(s.order, h)
+	return false
+}
+
+func (s *boundedHashSet) Remove(h types.Hash) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, h)
+}
+
+// NewManager creates a new P2P manager. ts may be nil if no time adjustment is needed.
+func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps store.PeerStore, listenAddr string, maxIn, maxOut int, seeds []string, ts TimeSampler) *Manager {
 	var nonce uint64
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -62,8 +133,11 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		maxInbound:  maxIn,
 		maxOutbound: maxOut,
 		seedPeers:   seeds,
+		timeSampler: ts,
 		peers:       make(map[string]*Peer),
 		localNonce:  nonce,
+		seenBlocks:  newBoundedHashSet(maxSeenBlocks),
+		seenTxs:     newBoundedHashSet(maxSeenTxs),
 	}
 }
 
@@ -136,7 +210,7 @@ func (m *Manager) PeerAddrs() []string {
 
 // BroadcastBlock announces a new block to all peers that don't already know it.
 func (m *Manager) BroadcastBlock(hash types.Hash, block *types.Block) {
-	m.seenBlocks.Store(hash, struct{}{})
+	m.seenBlocks.Add(hash)
 
 	inv := protocol.InvMsg{
 		Inventory: []protocol.InvVector{
@@ -159,7 +233,7 @@ func (m *Manager) BroadcastBlock(hash types.Hash, block *types.Block) {
 
 // BroadcastTx announces a new transaction to all peers.
 func (m *Manager) BroadcastTx(hash types.Hash) {
-	m.seenTxs.Store(hash, struct{}{})
+	m.seenTxs.Add(hash)
 
 	inv := protocol.InvMsg{
 		Inventory: []protocol.InvVector{
@@ -470,6 +544,11 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 	}
 
 	peer.SetVersion(&theirVersion)
+
+	if m.timeSampler != nil && theirVersion.Timestamp != 0 {
+		m.timeSampler.AddSample(peer.Addr(), theirVersion.Timestamp)
+	}
+
 	return nil
 }
 
@@ -604,7 +683,7 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	blockHash := crypto.HashBlockHeader(&block.Header)
 	peer.AddKnownInventory(blockHash)
 
-	if _, loaded := m.seenBlocks.LoadOrStore(blockHash, struct{}{}); loaded {
+	if m.seenBlocks.AddOrHas(blockHash) {
 		return
 	}
 
@@ -612,15 +691,21 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	if err != nil {
 		if errors.Is(err, chain.ErrSideChain) {
 			logging.L.Debug("block stored as side chain", "component", "p2p", "hash", blockHash.ReverseString(), "height", height)
-		} else {
-			// Block was rejected (orphan, invalid, etc). Remove it from the
-			// seenBlocks cache so it can be re-delivered by another peer.
-			// Without this, a block that arrives as an orphan due to a race
-			// (e.g. after a 1-deep reorg) is permanently poisoned.
-			m.seenBlocks.Delete(blockHash)
-			logging.L.Warn("block rejected", "component", "p2p", "hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
 			return
 		}
+		// Block was not accepted onto the active chain. Remove from
+		// seenBlocks so it can be re-delivered later. This covers:
+		//  - Orphans: parent unknown due to reorg race; parent may
+		//    arrive later and processOrphans will handle it, but if
+		//    the orphan's parent was reorged away and back, the block
+		//    needs to be re-deliverable.
+		//  - Validation failures: transient state may resolve.
+		// The orphan pool's own duplicate check prevents busy-loops.
+		m.seenBlocks.Remove(blockHash)
+		if !errors.Is(err, chain.ErrOrphanBlock) {
+			logging.L.Warn("block rejected", "component", "p2p", "hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
+		}
+		return
 	}
 
 	// Update mempool: remove confirmed transactions and update tip height.
@@ -635,6 +720,7 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	m.mempool.SetTipHeight(height)
 
 	// Update best peer height tracking for IBD detection.
+	peer.SetStartHeightIfGreater(height)
 	m.mu.Lock()
 	if height > m.bestPeerHeight {
 		m.bestPeerHeight = height
@@ -652,7 +738,7 @@ func (m *Manager) handleTx(peer *Peer, tx *types.Transaction) {
 	}
 	peer.AddKnownInventory(txHash)
 
-	if _, loaded := m.seenTxs.LoadOrStore(txHash, struct{}{}); loaded {
+	if m.seenTxs.AddOrHas(txHash) {
 		return
 	}
 

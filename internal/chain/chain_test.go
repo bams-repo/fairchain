@@ -51,7 +51,7 @@ func setupTestChain(t *testing.T) (*Chain, *fcparams.ChainParams) {
 	t.Cleanup(func() { s.Close() })
 
 	engine := pow.New()
-	c := New(p, engine, s)
+	c := New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
 	}
@@ -458,7 +458,7 @@ func setupRetargetChain(t *testing.T, interval uint32, blockSpacing time.Duratio
 	t.Cleanup(func() { s.Close() })
 
 	engine := pow.New()
-	c := New(p, engine, s)
+	c := New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
 	}

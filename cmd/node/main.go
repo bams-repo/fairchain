@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/big"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	fcparams "github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/rpc"
 	"github.com/bams-repo/fairchain/internal/store"
+	"github.com/bams-repo/fairchain/internal/timeadjust"
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
@@ -172,8 +174,11 @@ func main() {
 	// Create consensus engine.
 	engine := pow.New()
 
+	// Network-adjusted clock (Bitcoin Core GetAdjustedTime parity).
+	adjClock := timeadjust.New()
+
 	// Create blockchain.
-	bc := chain.New(params, engine, blockStore)
+	bc := chain.New(params, engine, blockStore, adjClock)
 	if err := bc.Init(); err != nil {
 		peerStore.Close()
 		blockStore.Close()
@@ -198,7 +203,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start P2P manager.
-	p2pMgr := p2p.NewManager(params, bc, mp, peerStore, cfg.ListenAddr, cfg.MaxInbound, cfg.MaxOutbound, cfg.SeedPeers)
+	p2pMgr := p2p.NewManager(params, bc, mp, peerStore, cfg.ListenAddr, cfg.MaxInbound, cfg.MaxOutbound, cfg.SeedPeers, adjClock)
 
 	// Load peers.dat and merge into peer store.
 	store.LoadPeersDat(cfg.PeersDatPath(), peerStore)
@@ -297,7 +302,20 @@ func main() {
 
 func initNetworkGenesis(p *fcparams.ChainParams) {
 	if !p.GenesisHash.IsZero() {
+		computed := crypto.HashBlockHeader(&p.GenesisBlock.Header)
+		if computed != p.GenesisHash {
+			logging.L.Error("genesis hash verification failed",
+				"network", p.Name,
+				"expected", p.GenesisHash.ReverseString(),
+				"computed", computed.ReverseString())
+			os.Exit(1)
+		}
 		return
+	}
+
+	if p.Name == "mainnet" {
+		logging.L.Error("mainnet requires a hardcoded genesis block in params")
+		os.Exit(1)
 	}
 
 	cfg := fcparams.GenesisConfig{
@@ -363,6 +381,13 @@ func migrateFromLegacy(cfg *config.Config, params *fcparams.ChainParams) error {
 	defer newStore.Close()
 
 	// Migrate blocks from height 0 to tip.
+	// Keep cumulative chainwork exactly like Bitcoin Core's nChainWork:
+	// chainWork(block) = chainWork(parent) + work(block).
+	cumulativeWork := store.CalcWork(params.GenesisBlock.Header.Bits)
+	if tipHeight > 0 {
+		// Reset to zero so we accumulate from the first migrated block below.
+		cumulativeWork.SetInt64(0)
+	}
 	for h := uint32(0); h <= tipHeight; h++ {
 		hash, err := legacy.LegacyGetBlockByHeight(h)
 		if err != nil {
@@ -379,6 +404,7 @@ func migrateFromLegacy(cfg *config.Config, params *fcparams.ChainParams) error {
 		}
 
 		blockWork := store.CalcWork(block.Header.Bits)
+		cumulativeWork = new(big.Int).Add(cumulativeWork, blockWork)
 		rec := &store.DiskBlockIndex{
 			Header:    block.Header,
 			Height:    h,
@@ -387,7 +413,7 @@ func migrateFromLegacy(cfg *config.Config, params *fcparams.ChainParams) error {
 			FileNum:   fileNum,
 			DataPos:   offset,
 			DataSize:  size,
-			ChainWork: blockWork,
+			ChainWork: new(big.Int).Set(cumulativeWork),
 		}
 
 		// Migrate undo data if available.
