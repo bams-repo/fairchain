@@ -195,12 +195,16 @@ func (s *Set) Count() int {
 	return len(s.entries)
 }
 
-// TotalValue returns the sum of all UTXO values.
+// TotalValue returns the sum of all UTXO values. Returns math.MaxUint64 if
+// the sum would overflow, indicating a corrupted or inflated UTXO set.
 func (s *Set) TotalValue() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var total uint64
 	for _, e := range s.entries {
+		if total+e.Value < total {
+			return ^uint64(0) // overflow sentinel
+		}
 		total += e.Value
 	}
 	return total
@@ -304,31 +308,44 @@ func (s *Set) ConnectBlock(block *types.Block, height uint32) (*BlockUndoData, e
 }
 
 // DisconnectBlock reverses a block's effect on the UTXO set using undo data.
+// All mutations are computed first and applied atomically under a single lock,
+// ensuring no partial state is visible to concurrent readers on error.
 func (s *Set) DisconnectBlock(block *types.Block, undo *BlockUndoData) error {
+	// Phase 1: compute all keys to remove (no mutation yet).
+	var toRemove [][36]byte
 	for txIdx := len(block.Transactions) - 1; txIdx >= 0; txIdx-- {
 		tx := &block.Transactions[txIdx]
 		txHash, err := crypto.HashTransaction(tx)
 		if err != nil {
 			return fmt.Errorf("hash tx %d: %w", txIdx, err)
 		}
-
 		for outIdx := range tx.Outputs {
-			s.mu.Lock()
-			delete(s.entries, OutpointKey(txHash, uint32(outIdx)))
-			s.mu.Unlock()
+			toRemove = append(toRemove, OutpointKey(txHash, uint32(outIdx)))
 		}
 	}
 
+	// Phase 2: apply all mutations atomically.
+	s.mu.Lock()
+	for _, key := range toRemove {
+		delete(s.entries, key)
+	}
 	for _, spent := range undo.SpentOutputs {
 		entryCopy := spent.Entry
-		s.Add(spent.OutPoint.Hash, spent.OutPoint.Index, &entryCopy)
+		entryCopy.PkScript = make([]byte, len(spent.Entry.PkScript))
+		copy(entryCopy.PkScript, spent.Entry.PkScript)
+		key := OutpointKey(spent.OutPoint.Hash, spent.OutPoint.Index)
+		s.entries[key] = &entryCopy
 	}
+	s.mu.Unlock()
 
 	return nil
 }
 
 // ConnectGenesis applies the genesis block to an empty UTXO set.
 // Genesis has no inputs to validate, only outputs to add.
+// Outputs with legacy placeholder scripts (empty or single-byte {0x00}) are
+// excluded from the UTXO set entirely, matching Bitcoin Core's behavior of
+// never inserting the genesis coinbase into the UTXO set.
 func (s *Set) ConnectGenesis(block *types.Block) error {
 	for txIdx := range block.Transactions {
 		tx := &block.Transactions[txIdx]
@@ -337,6 +354,9 @@ func (s *Set) ConnectGenesis(block *types.Block) error {
 			return fmt.Errorf("hash genesis tx %d: %w", txIdx, err)
 		}
 		for outIdx, out := range tx.Outputs {
+			if isLegacyPlaceholder(out.PkScript) {
+				continue
+			}
 			s.Add(txHash, uint32(outIdx), &UtxoEntry{
 				Value:      out.Value,
 				PkScript:   out.PkScript,
@@ -348,18 +368,27 @@ func (s *Set) ConnectGenesis(block *types.Block) error {
 	return nil
 }
 
-// Entries returns a snapshot of all UTXO entries (for persistence).
+func isLegacyPlaceholder(pk []byte) bool {
+	return len(pk) == 0 || (len(pk) == 1 && pk[0] == 0x00)
+}
+
+// Entries returns a deep-copy snapshot of all UTXO entries (for persistence).
+// Callers may freely mutate the returned entries without affecting the live set.
 func (s *Set) Entries() map[[36]byte]*UtxoEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	snapshot := make(map[[36]byte]*UtxoEntry, len(s.entries))
 	for k, v := range s.entries {
-		snapshot[k] = v
+		entryCopy := *v
+		entryCopy.PkScript = make([]byte, len(v.PkScript))
+		copy(entryCopy.PkScript, v.PkScript)
+		snapshot[k] = &entryCopy
 	}
 	return snapshot
 }
 
-// ForEach iterates over all UTXO entries, calling fn with the tx hash, output index, and entry.
+// ForEach iterates over all UTXO entries, calling fn with the tx hash, output
+// index, and a deep copy of the entry. Callers cannot corrupt the live set.
 func (s *Set) ForEach(fn func(txHash types.Hash, index uint32, entry *UtxoEntry)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -367,6 +396,9 @@ func (s *Set) ForEach(fn func(txHash types.Hash, index uint32, entry *UtxoEntry)
 		var txHash types.Hash
 		copy(txHash[:], key[:32])
 		index := binary.LittleEndian.Uint32(key[32:])
-		fn(txHash, index, entry)
+		entryCopy := *entry
+		entryCopy.PkScript = make([]byte, len(entry.PkScript))
+		copy(entryCopy.PkScript, entry.PkScript)
+		fn(txHash, index, &entryCopy)
 	}
 }

@@ -29,6 +29,7 @@ const (
 	CmdTx        = "tx"
 	CmdGetBlocks = "getblocks"
 	CmdAddr      = "addr"
+	CmdGetAddr   = "getaddr"
 	CmdReject    = "reject"
 )
 

@@ -8,5 +8,7 @@
   "max_outbound": 8,
   "mining_enabled": false,
   "mining_addr": "",
-  "log_level": "info"
+  "log_level": "info",
+  "rpc_user": "",
+  "rpc_password": ""
 }

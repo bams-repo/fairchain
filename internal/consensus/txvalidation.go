@@ -101,6 +101,9 @@ func ValidateTransactionInputs(block *types.Block, utxoSet *utxo.Set, height uin
 			if out.Value == 0 {
 				return 0, fmt.Errorf("tx %s output %d: zero value not allowed", txHash, outIdx)
 			}
+			if out.Value > params.MaxMoneyValue {
+				return 0, fmt.Errorf("tx %s output %d: value %d exceeds max money %d", txHash, outIdx, out.Value, params.MaxMoneyValue)
+			}
 			if totalOut+out.Value < totalOut {
 				return 0, fmt.Errorf("tx %s output %d: value overflow", txHash, outIdx)
 			}
@@ -111,25 +114,22 @@ func ValidateTransactionInputs(block *types.Block, utxoSet *utxo.Set, height uin
 			return 0, fmt.Errorf("tx %s: input value %d < output value %d", txHash, totalIn, totalOut)
 		}
 
-		// Script validation: verify each input's SignatureScript satisfies the
-		// referenced UTXO's PkScript. This is the spend authorization check.
-		scriptActivation, hasActivation := p.ActivationHeights["script_validation"]
-		if !hasActivation || height >= scriptActivation {
-			for inIdx, in := range tx.Inputs {
-				entry := utxoSet.Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
-				if entry == nil {
-					continue // already validated above
-				}
-				if script.IsLegacyUnvalidatedScript(entry.PkScript) {
-					continue
-				}
-				if err := script.Verify(in.SignatureScript, entry.PkScript, tx, inIdx); err != nil {
-					return 0, fmt.Errorf("tx %s input %d: script validation failed: %w", txHash, inIdx, err)
-				}
-			}
+	// Script validation: verify each input's SignatureScript satisfies the
+	// referenced UTXO's PkScript. This is the spend authorization check.
+	for inIdx, in := range tx.Inputs {
+		entry := utxoSet.Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
+		if entry == nil {
+			continue // already validated above
 		}
+		if script.IsLegacyUnvalidatedScript(entry.PkScript) {
+			continue
+		}
+		if err := script.Verify(in.SignatureScript, entry.PkScript, tx, inIdx); err != nil {
+			return 0, fmt.Errorf("tx %s input %d: script validation failed: %w", txHash, inIdx, err)
+		}
+	}
 
-		fee := totalIn - totalOut
+	fee := totalIn - totalOut
 		if totalFees+fee < totalFees {
 			return 0, fmt.Errorf("total fees overflow at tx %d", txIdx)
 		}
@@ -218,6 +218,9 @@ func ValidateSingleTransaction(tx *types.Transaction, utxoSet *utxo.Set, tipHeig
 		if out.Value == 0 {
 			return 0, fmt.Errorf("tx %s output %d: zero value not allowed", txHash, outIdx)
 		}
+		if out.Value > params.MaxMoneyValue {
+			return 0, fmt.Errorf("tx %s output %d: value %d exceeds max money %d", txHash, outIdx, out.Value, params.MaxMoneyValue)
+		}
 		if totalOut+out.Value < totalOut {
 			return 0, fmt.Errorf("tx %s output %d: value overflow", txHash, outIdx)
 		}
@@ -229,19 +232,16 @@ func ValidateSingleTransaction(tx *types.Transaction, utxoSet *utxo.Set, tipHeig
 	}
 
 	// Script validation for mempool admission.
-	scriptActivation, hasActivation := p.ActivationHeights["script_validation"]
-	if !hasActivation || spendHeight >= scriptActivation {
-		for inIdx, in := range tx.Inputs {
-			entry := utxoSet.Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
-			if entry == nil {
-				continue
-			}
-			if script.IsLegacyUnvalidatedScript(entry.PkScript) {
-				continue
-			}
-			if err := script.Verify(in.SignatureScript, entry.PkScript, tx, inIdx); err != nil {
-				return 0, fmt.Errorf("tx %s input %d: script validation failed: %w", txHash, inIdx, err)
-			}
+	for inIdx, in := range tx.Inputs {
+		entry := utxoSet.Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
+		if entry == nil {
+			continue
+		}
+		if script.IsLegacyUnvalidatedScript(entry.PkScript) {
+			continue
+		}
+		if err := script.Verify(in.SignatureScript, entry.PkScript, tx, inIdx); err != nil {
+			return 0, fmt.Errorf("tx %s input %d: script validation failed: %w", txHash, inIdx, err)
 		}
 	}
 
@@ -250,7 +250,7 @@ func ValidateSingleTransaction(tx *types.Transaction, utxoSet *utxo.Set, tipHeig
 }
 
 // CalcTxFee computes the fee for a transaction given the UTXO set.
-// Returns 0 for coinbase transactions.
+// Returns 0 for coinbase transactions or on overflow.
 func CalcTxFee(tx *types.Transaction, utxoSet *utxo.Set) uint64 {
 	if tx.IsCoinbase() {
 		return 0
@@ -259,12 +259,20 @@ func CalcTxFee(tx *types.Transaction, utxoSet *utxo.Set) uint64 {
 	for _, in := range tx.Inputs {
 		entry := utxoSet.Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
 		if entry != nil {
+			prev := totalIn
 			totalIn += entry.Value
+			if totalIn < prev {
+				return 0
+			}
 		}
 	}
 	var totalOut uint64
 	for _, out := range tx.Outputs {
+		prev := totalOut
 		totalOut += out.Value
+		if totalOut < prev {
+			return 0
+		}
 	}
 	if totalIn <= totalOut {
 		return 0

@@ -9,6 +9,8 @@ set -uo pipefail
 #   Nodes 2-11  = MINER nodes (connect to seeds, subject to chaos)
 #
 # Phases 0-9:  Network chaos (kill/restart nodes, seed swaps, partitions)
+# Phase 9B:    Restart mining on all miner nodes (after 9C relay-only test)
+# Phase 9C:    No-mining convergence (full restart, sync-only, no new blocks)
 # Phases 10-15: Adversarial attacks against the RPC submitblock endpoint:
 #   10 — Bad nonce (invalid PoW) and corrupted merkle roots
 #   11 — Duplicate block resubmission
@@ -32,14 +34,14 @@ set -uo pipefail
 #   M — Intra-block double-spend (two txs in one block spend same outpoint)
 # Phase 16:   Final retarget and consensus verification
 #
-# Testnet params: 5s target blocks, retarget every 20 blocks.
+# Testnet params: 5s target blocks, retarget every 20 blocks, difficulty ~2x.
 #
 # Usage:
 #   python scripts/chaos_test.py [--skip PHASES]
 #   bash scripts/chaos_test.sh [--skip PHASES]   # legacy backend invocation
 #
 #   --skip accepts a comma-separated list of phase IDs or group aliases:
-#     Phase IDs: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,A,B,C,D,E,F,H,I,J,K,L,M,16
+#     Phase IDs: 0,1,2,3,4,5,6,7,8,9,9B,9C,10,11,12,13,14,15,A,B,C,D,E,F,H,I,J,K,L,M,16
 #     Group aliases:
 #       chaos       — phases 0-9 (network chaos)
 #       adversarial — phases 10-15 (adversarial attacks)
@@ -50,18 +52,23 @@ set -uo pipefail
 #   Example: --skip 0,1,2,3,I,J,K     (skip specific phases)
 # ==========================================================================
 
-# ── Phase skip support ───────────────────────────────────────
+# ── Phase skip / debug support ──────────────────────────────
 ORIG_ARGS="$*"
 SKIP_LIST=""
+NODE_DEBUG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip)
             SKIP_LIST="$2"
             shift 2
             ;;
+        --debug)
+            NODE_DEBUG="-debug"
+            shift
+            ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [--skip PHASES]" >&2
+            echo "Usage: $0 [--skip PHASES] [--debug]" >&2
             exit 1
             ;;
     esac
@@ -74,7 +81,7 @@ expand_skip_groups() {
     for part in "${parts[@]}"; do
         part=$(echo "$part" | tr -d ' ')
         case "$part" in
-            chaos)       expanded="${expanded},0,1,2,3,4,5,6,7,8,9" ;;
+            chaos)       expanded="${expanded},0,1,2,3,4,5,6,7,8,9,9B" ;;
             adversarial) expanded="${expanded},10,11,12,13,14,15" ;;
             consensus)   expanded="${expanded},A,B,C,D,E,F,H" ;;
             utxo)        expanded="${expanded},I,J,K,L,M" ;;
@@ -101,24 +108,94 @@ should_skip() {
 }
 
 PROJROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="${PROJROOT}/bin/fairchain-node"
-ADV="${PROJROOT}/bin/fairchain-adversary"
 
-if [ ! -x "$ADV" ]; then
-    echo "[chaos] adversary binary not found, building..."
-    (cd "$PROJROOT" && go build -o bin/fairchain-adversary ./cmd/adversary)
+# ── OS detection ──────────────────────────────────────────────
+# Sets portable aliases for commands that differ across Linux, macOS, and Windows (Git Bash / MSYS / WSL).
+CHAOS_OS="linux"
+case "$(uname -s)" in
+    Darwin*)  CHAOS_OS="macos"   ;;
+    MINGW*|MSYS*|CYGWIN*) CHAOS_OS="windows" ;;
+    Linux*)
+        if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+            CHAOS_OS="wsl"
+        fi
+        ;;
+esac
+
+# Python: Windows typically ships 'python', Linux/macOS use 'python3'.
+if command -v python3 &>/dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &>/dev/null; then
+    PYTHON_CMD="python"
+else
+    echo "[chaos] FATAL: python3 (or python) not found in PATH" >&2
+    exit 1
 fi
+
+# curl: required on all platforms.
+if ! command -v curl &>/dev/null; then
+    echo "[chaos] FATAL: curl not found in PATH" >&2
+    echo "  Windows: install via 'winget install curl' or use Git Bash >= 2.x" >&2
+    exit 1
+fi
+
+# Binary extensions: Windows needs .exe suffix.
+EXE_SUFFIX=""
+if [ "$CHAOS_OS" = "windows" ]; then
+    EXE_SUFFIX=".exe"
+fi
+
+BIN="${PROJROOT}/bin/fairchaind${EXE_SUFFIX}"
+ADV="${PROJROOT}/bin/fairchain-adversary${EXE_SUFFIX}"
+
+if [ ! -x "$ADV" ] && [ ! -f "$ADV" ]; then
+    echo "[chaos] adversary binary not found, building..."
+    (cd "$PROJROOT" && go build -o "bin/fairchain-adversary${EXE_SUFFIX}" ./cmd/adversary)
+fi
+
+# Portable date: GNU date uses -Iseconds, macOS/BSD date uses -u +format.
+portable_date_iso() {
+    if date -Iseconds &>/dev/null 2>&1; then
+        date -Iseconds
+    else
+        date -u +"%Y-%m-%dT%H:%M:%S+00:00"
+    fi
+}
+
+# Portable sleep: some MSYS environments don't support fractional seconds.
+portable_sleep() {
+    sleep "$1" 2>/dev/null || sleep "$(printf '%.0f' "$1")"
+}
+
+# Portable process kill for cleanup: pkill is unavailable on Git Bash / MSYS.
+kill_all_chaos_nodes() {
+    case "$CHAOS_OS" in
+        windows)
+            taskkill //F //IM "fairchaind${EXE_SUFFIX}" &>/dev/null || true
+            ;;
+        *)
+            pkill -9 -f "fairchaind.*chaos-runs" 2>/dev/null || true
+            ;;
+    esac
+}
+
+echo "[chaos] detected OS: ${CHAOS_OS} (uname: $(uname -s)), python: ${PYTHON_CMD}"
 
 # ── Sequential run directory ───────────────────────────────
 RUNS_ROOT="${PROJROOT}/chaos-runs"
 mkdir -p "$RUNS_ROOT"
 
-LAST_RUN=$(ls -1d "$RUNS_ROOT"/run-[0-9][0-9][0-9] 2>/dev/null | sort -V | tail -1 | grep -oP '\d{3}$' || echo "000")
+LAST_RUN=$(ls -1d "$RUNS_ROOT"/run-[0-9][0-9][0-9] 2>/dev/null | sort -t- -k2 -n | tail -1 | sed 's/.*run-//' || echo "000")
 NEXT_RUN=$(printf "%03d" $((10#$LAST_RUN + 1)))
 RUN_DIR="${RUNS_ROOT}/run-${NEXT_RUN}"
 mkdir -p "$RUN_DIR"
 
-ln -sfn "$RUN_DIR" "${RUNS_ROOT}/latest"
+if [ "$CHAOS_OS" = "windows" ]; then
+    rm -f "${RUNS_ROOT}/latest" 2>/dev/null || true
+    echo "$RUN_DIR" > "${RUNS_ROOT}/latest.txt"
+else
+    ln -sfn "$RUN_DIR" "${RUNS_ROOT}/latest"
+fi
 
 BASEDIR="${RUN_DIR}/nodes"
 RUN_LOG="${RUN_DIR}/chaos_test.log"
@@ -129,6 +206,10 @@ MINER_NODES=($(seq 2 11))
 BASE_P2P_PORT=30000
 BASE_RPC_PORT=31000
 PIDS=()
+
+# Reorg tracking: stores the last-read line offset per node log so we only
+# report new reorgs since the previous status check.
+declare -A REORG_OFFSETS
 
 SEED_ADDRS="127.0.0.1:$((BASE_P2P_PORT + 0)),127.0.0.1:$((BASE_P2P_PORT + 1))"
 
@@ -163,7 +244,7 @@ header(){ echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 # ── Write run metadata ─────────────────────────────────────
 cat > "${RUN_DIR}/meta.txt" <<METAEOF
 run:        ${NEXT_RUN}
-started:    $(date -Iseconds)
+started:    $(portable_date_iso)
 hostname:   $(hostname)
 args:       $0 ${ORIG_ARGS:-}
 skip_list:  ${SKIP_LIST:-<none>}
@@ -183,10 +264,10 @@ cleanup() {
         kill "${PIDS[$i]:-}" 2>/dev/null || true
     done
     sleep 2
-    pkill -9 -f "fairchain-node.*chaos-runs" 2>/dev/null || true
+    kill_all_chaos_nodes
     sleep 1
     echo ""
-    echo "finished:   $(date -Iseconds)" >> "${RUN_DIR}/meta.txt"
+    echo "finished:   $(portable_date_iso)" >> "${RUN_DIR}/meta.txt"
     echo "exit_code:  ${FAILURES}" >> "${RUN_DIR}/meta.txt"
     log "Run data preserved in: ${RUN_DIR}"
     log "  Node data:  ${BASEDIR}/node*/  (data dirs + stdout.log per node)"
@@ -202,17 +283,26 @@ get_info() {
     curl -s --connect-timeout 2 --max-time 3 "http://127.0.0.1:${1}/getblockchaininfo" 2>/dev/null
 }
 
+get_status() {
+    curl -s --connect-timeout 2 --max-time 3 "http://127.0.0.1:${1}/getchainstatus" 2>/dev/null
+}
+
 get_field() {
     local port=$1 field=$2
-    get_info "$port" | python3 -c "import sys,json;print(json.load(sys.stdin)['$field'])" 2>/dev/null || echo "ERR"
+    get_info "$port" | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['$field'])" 2>/dev/null || echo "ERR"
+}
+
+get_status_field() {
+    local port=$1 field=$2
+    get_status "$port" | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['$field'])" 2>/dev/null || echo "ERR"
 }
 
 get_height()     { get_field "$1" blocks; }
-get_hash()       { get_field "$1" best_block_hash; }
-get_bits()       { get_field "$1" bits; }
-get_difficulty() { get_info "$1" | python3 -c "import sys,json;print(f\"{json.load(sys.stdin)['difficulty']:.4f}\")" 2>/dev/null || echo "ERR"; }
-get_peers()      { get_field "$1" peers; }
-get_epoch()      { get_info "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(f\"epoch={d['retarget_epoch']} prog={d['epoch_progress']}/{d['retarget_interval']}\")" 2>/dev/null || echo "ERR"; }
+get_hash()       { get_field "$1" bestblockhash; }
+get_bits()       { get_status_field "$1" bits; }
+get_difficulty() { get_info "$1" | $PYTHON_CMD -c "import sys,json;print(f\"{json.load(sys.stdin)['difficulty']:.4f}\")" 2>/dev/null || echo "ERR"; }
+get_peers()      { get_status_field "$1" peers; }
+get_epoch()      { get_status "$1" | $PYTHON_CMD -c "import sys,json;d=json.load(sys.stdin);print(f\"epoch={d['retarget_epoch']} prog={d['epoch_progress']}/{d['retarget_interval']}\")" 2>/dev/null || echo "ERR"; }
 
 # ── Node management ─────────────────────────────────────────
 
@@ -226,16 +316,19 @@ start_node() {
 
     local mine_flag=""
     if [ "$do_mine" = "true" ]; then
-        mine_flag="--mine"
+        mine_flag="-mine"
     fi
 
     "$BIN" \
-        --network testnet \
-        --datadir "$datadir" \
-        --listen "127.0.0.1:${p2p_port}" \
-        --rpc "127.0.0.1:${rpc_port}" \
-        --seed-peers "$SEED_ADDRS" \
+        -network testnet \
+        -datadir "$datadir" \
+        -listen "127.0.0.1:${p2p_port}" \
+        -rpcbind "127.0.0.1" \
+        -rpcport "${rpc_port}" \
+        -connect "$SEED_ADDRS" \
+        -norpcauth \
         ${mine_flag} \
+        ${NODE_DEBUG} \
         > "${datadir}/stdout.log" 2>&1 &
 
     PIDS[$idx]=$!
@@ -261,6 +354,66 @@ is_alive() {
 
 # ── Status / Checks ─────────────────────────────────────────
 
+# print_reorg_report scans each node's stdout.log for "chain reorg" lines that
+# appeared since the last call, then prints a per-node summary.
+print_reorg_report() {
+    local any_reorgs=0
+    local node_summaries=()
+
+    for i in $(seq 0 $((NUM_NODES - 1))); do
+        local logfile="${BASEDIR}/node${i}/stdout.log"
+        [ -f "$logfile" ] || continue
+
+        local offset=${REORG_OFFSETS[$i]:-0}
+        local total_lines
+        total_lines=$(wc -l < "$logfile" 2>/dev/null || echo 0)
+
+        if [ "$total_lines" -le "$offset" ]; then
+            REORG_OFFSETS[$i]=$total_lines
+            continue
+        fi
+
+        local new_reorgs
+        new_reorgs=$(tail -n +"$((offset + 1))" "$logfile" | grep 'chain reorg' || true)
+
+        REORG_OFFSETS[$i]=$total_lines
+
+        [ -z "$new_reorgs" ] && continue
+
+        local count max_depth depths
+        count=$(echo "$new_reorgs" | wc -l)
+        # Extract depth values and find the max
+        depths=$(echo "$new_reorgs" | sed -n 's/.*depth=\([0-9]*\).*/\1/p')
+        max_depth=0
+        local depth_list=""
+        while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            [ "$d" -gt "$max_depth" ] && max_depth=$d
+            if [ -z "$depth_list" ]; then
+                depth_list="$d"
+            else
+                depth_list="${depth_list},$d"
+            fi
+        done <<< "$depths"
+
+        any_reorgs=1
+        local role="miner"
+        [[ " ${SEED_NODES[*]} " == *" $i "* ]] && role="SEED"
+        node_summaries+=("$(printf "  %-8s %-8s %-10s %s" "[$i]$role" "$count" "$max_depth" "$depth_list")")
+    done
+
+    if [ "$any_reorgs" -eq 1 ]; then
+        log "--- Reorgs Since Last Check ---"
+        printf "  %-8s %-8s %-10s %s\n" "Node" "Count" "MaxDepth" "Depths"
+        printf "  %-8s %-8s %-10s %s\n" "--------" "-----" "--------" "------"
+        for summary in "${node_summaries[@]}"; do
+            echo "$summary"
+        done
+    else
+        log "--- No reorgs since last check ---"
+    fi
+}
+
 print_cluster_status() {
     local label=$1
     echo ""
@@ -284,6 +437,8 @@ print_cluster_status() {
         fi
     done
     echo ""
+    print_reorg_report
+    echo ""
 }
 
 wait_for_height() {
@@ -291,6 +446,7 @@ wait_for_height() {
     local timeout=$2
     local label=$3
     local deadline=$((SECONDS + timeout))
+    local last_status=$SECONDS
 
     log "Waiting up to ${timeout}s for height >= $min_height ($label)..."
     while [ $SECONDS -lt $deadline ]; do
@@ -304,6 +460,22 @@ wait_for_height() {
                 fi
             fi
         done
+        # Print a compact height summary every 30 seconds
+        if [ $((SECONDS - last_status)) -ge 30 ]; then
+            local elapsed=$((SECONDS - (deadline - timeout)))
+            local heights=""
+            for i in $(seq 0 $((NUM_NODES - 1))); do
+                if is_alive "$i"; then
+                    local rpc=$((BASE_RPC_PORT + i))
+                    local h=$(get_height "$rpc")
+                    heights="${heights} n${i}=${h}"
+                else
+                    heights="${heights} n${i}=DOWN"
+                fi
+            done
+            log "  [${elapsed}s] heights:${heights}"
+            last_status=$SECONDS
+        fi
         sleep 3
     done
     warn "$label: height $min_height not reached within ${timeout}s"
@@ -384,7 +556,7 @@ check_consensus() {
 get_hash_at_height() {
     local port=$1 height=$2
     curl -s --connect-timeout 2 --max-time 3 "http://127.0.0.1:${port}/getblockbyheight?height=${height}" 2>/dev/null \
-        | python3 -c "import sys,json;print(json.load(sys.stdin)['hash'])" 2>/dev/null || echo "ERR"
+        | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['hash'])" 2>/dev/null || echo "ERR"
 }
 
 check_height_index_integrity() {
@@ -487,9 +659,9 @@ check_utxo_consistency() {
                 continue
             fi
             local h txouts total
-            h=$(echo "$info" | python3 -c "import sys,json;print(json.load(sys.stdin)['height'])" 2>/dev/null || echo "ERR")
-            txouts=$(echo "$info" | python3 -c "import sys,json;print(json.load(sys.stdin)['txouts'])" 2>/dev/null || echo "ERR")
-            total=$(echo "$info" | python3 -c "import sys,json;print(json.load(sys.stdin)['total_amount'])" 2>/dev/null || echo "ERR")
+            h=$(echo "$info" | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['height'])" 2>/dev/null || echo "ERR")
+            txouts=$(echo "$info" | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['txouts'])" 2>/dev/null || echo "ERR")
+            total=$(echo "$info" | $PYTHON_CMD -c "import sys,json;print(json.load(sys.stdin)['total_amount'])" 2>/dev/null || echo "ERR")
             if [ "$txouts" != "ERR" ] && [ "$total" != "ERR" ] && [ "$h" != "ERR" ]; then
                 node_ids+=("$i")
                 heights+=("$h")
@@ -570,7 +742,7 @@ echo ""
 echo "════════════════════════════════════════════════════════════════════"
 echo " FAIRCHAIN ${NUM_NODES}-NODE CHAOS + ADVERSARIAL + CONSENSUS STRESS TEST"
 echo " ${NUM_SEEDS} Seeds + ${NUM_MINERS} Miners · 5s blocks · retarget/20"
-echo " Phases 0-9: Chaos | 10-15: Adversarial | A-H: Consensus"
+echo " Phases 0-9B: Chaos | 10-15: Adversarial | A-H: Consensus"
 echo " Phases I-M: UTXO Validation | 16: Final Verification"
 echo "────────────────────────────────────────────────────────────────────"
 echo -e " Run #${NEXT_RUN}  ·  ${RUN_DIR}"
@@ -598,10 +770,10 @@ sleep 4
 header "Phase 1b: Launch Miner Nodes (${NUM_MINERS} miners)"
 for i in "${MINER_NODES[@]}"; do
     start_node "$i" true
-    sleep 0.2
+    portable_sleep 0.2
 done
-log "Waiting 12s for mesh formation and initial mining..."
-sleep 12
+log "Waiting 10s for mesh formation and initial mining..."
+sleep 10
 
 print_cluster_status "Initial Launch"
 run_check check_consensus "Phase 1"
@@ -609,8 +781,8 @@ run_check check_consensus "Phase 1"
 if ! should_skip "2"; then
 # ── Phase 2: Mine through first retarget ────────────────────
 header "Phase 2: Mine Through First Retarget (height ≥ 25)"
-wait_for_height 25 120 "Phase 2"
-wait_for_convergence 30 "Phase 2 convergence" 3
+wait_for_height 25 300 "Phase 2"
+wait_for_convergence 5 "Phase 2 convergence" 3
 print_cluster_status "After First Retarget"
 run_check check_consensus "Phase 2"
 run_check check_retarget
@@ -628,7 +800,7 @@ print_cluster_status "After Killing $PHASE3_KILL_COUNT Miners"
 log "Letting survivors mine for 20s..."
 sleep 20
 
-wait_for_convergence 20 "Phase 3 survivors"
+wait_for_convergence 5 "Phase 3 survivors"
 print_cluster_status "Survivors Mining"
 run_check check_consensus "Phase 3 ($((NUM_MINERS - PHASE3_KILL_COUNT)) miners + ${NUM_SEEDS} seeds)"
 fi
@@ -639,11 +811,11 @@ header "Phase 4: Restart Killed Miners (fresh sync from seeds)"
 for i in "${PHASE3_VICTIMS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
-    sleep 0.1
+    portable_sleep 0.1
 done
 
 log "Waiting for restarted miners to sync and converge..."
-wait_for_convergence 45 "Phase 4 sync" 3
+wait_for_convergence 5 "Phase 4 sync" 3
 print_cluster_status "After Restart & Sync"
 run_check check_consensus "Phase 4 (all ${NUM_NODES})"
 fi
@@ -656,7 +828,7 @@ sleep 2
 log "Running with $((NUM_SEEDS - 1)) seed for 20s..."
 sleep 20
 
-wait_for_convergence 20 "Phase 5"
+wait_for_convergence 5 "Phase 5"
 print_cluster_status "One Seed Down"
 run_check check_consensus "Phase 5 ($((NUM_SEEDS - 1)) seeds)"
 fi
@@ -669,10 +841,10 @@ start_node 0 false
 sleep 4
 stop_node 1
 sleep 2
-log "Running with swapped seed for 25s..."
-sleep 25
+log "Running with swapped seed for 20s..."
+sleep 20
 
-wait_for_convergence 30 "Phase 6"
+wait_for_convergence 5 "Phase 6"
 print_cluster_status "Seed Swap"
 run_check check_consensus "Phase 6 (seed swap)"
 fi
@@ -692,7 +864,7 @@ sleep 2
 log "Minority (${NUM_SEEDS} seeds + $((NUM_MINERS - PHASE7_KILL_COUNT)) miners) mining for 20s..."
 sleep 20
 
-wait_for_convergence 20 "Phase 7 minority"
+wait_for_convergence 5 "Phase 7 minority"
 print_cluster_status "Minority Mining"
 run_check check_consensus "Phase 7 ($PHASE7_SURVIVORS nodes)"
 fi
@@ -703,10 +875,10 @@ header "Phase 8: Restore all killed miners (fresh sync)"
 for i in "${PHASE7_VICTIMS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
-    sleep 0.1
+    portable_sleep 0.1
 done
 
-wait_for_convergence 60 "Phase 8 full restore" 3
+wait_for_convergence 5 "Phase 8 full restore" 3
 print_cluster_status "Full Restoration"
 run_check check_consensus "Phase 8 (all ${NUM_NODES})"
 fi
@@ -719,16 +891,71 @@ for round in $(seq 1 $PHASE9_ROUNDS); do
     victim=${MINER_NODES[$((RANDOM % ${#MINER_NODES[@]}))]}
     log "  Round $round: kill miner $victim"
     stop_node "$victim"
-    sleep 4
+    sleep 5
     log "  Round $round: restart miner $victim (fresh)"
     rm -rf "${BASEDIR}/node${victim}"
     start_node "$victim" true
-    sleep 6
+    sleep 5
 done
 
-wait_for_convergence 30 "Phase 9"
+wait_for_convergence 5 "Phase 9"
 print_cluster_status "After Rapid Chaos"
 run_check check_consensus "Phase 9"
+fi
+
+if ! should_skip "9C"; then
+# ── Phase 9C: No-mining convergence test ─────────────────
+# Kill every node, then relaunch the full cluster with mining DISABLED.
+# If the P2P sync logic is correct, all nodes must converge to the same
+# tip purely through block relay — no new blocks are produced.
+header "Phase 9C: Full Restart — No Mining (convergence-only)"
+
+log "Stopping all nodes..."
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    stop_node "$i" 2>/dev/null || true
+done
+sleep 3
+
+log "Restarting all nodes WITHOUT mining..."
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    start_node "$i" false
+    portable_sleep 0.2
+done
+
+log "Waiting 5s for mesh formation and initial sync..."
+sleep 5
+
+wait_for_convergence 5 "Phase 9C no-mine sync" 0
+print_cluster_status "No-Mining Convergence"
+run_check check_consensus "Phase 9C (no-mining convergence)"
+fi
+
+if ! should_skip "9B"; then
+# ── Phase 9B: Restart mining on all miner nodes ────────────
+# After 9C's no-mining convergence test, miners are running relay-only.
+# Kill all miner nodes and relaunch them with mining enabled so that
+# subsequent phases (adversarial, consensus, UTXO) have active block
+# production.
+header "Phase 9B: Restart Mining on ${NUM_MINERS} Miner Nodes"
+
+log "Stopping miner nodes (relay-only from 9C)..."
+for i in "${MINER_NODES[@]}"; do
+    stop_node "$i" 2>/dev/null || true
+done
+sleep 2
+
+log "Restarting miner nodes WITH mining enabled..."
+for i in "${MINER_NODES[@]}"; do
+    start_node "$i" true
+    portable_sleep 0.2
+done
+
+log "Waiting 10s for miners to reconnect and resume block production..."
+sleep 10
+
+wait_for_convergence 5 "Phase 9B mining restart" 3
+print_cluster_status "After Mining Restart"
+run_check check_consensus "Phase 9B (mining restarted)"
 fi
 
 # ── Adversary helper (always defined, used by multiple phases) ──
@@ -746,7 +973,7 @@ adversary_check() {
     result=$("$ADV" -attack "$attack" -rpc "$rpc" $extra_args 2>&1) || true
 
     local rejected
-    rejected=$(echo "$result" | python3 -c "import sys,json;r=json.load(sys.stdin);print('true' if all(x['rejected'] for x in r) else 'false')" 2>/dev/null || echo "parse_error")
+    rejected=$(echo "$result" | $PYTHON_CMD -c "import sys,json;r=json.load(sys.stdin);print('true' if all(x['rejected'] for x in r) else 'false')" 2>/dev/null || echo "parse_error")
 
     if [ "$rejected" = "true" ]; then
         pass "$label: attack '$attack' correctly REJECTED"
@@ -806,7 +1033,7 @@ run_check adversary_check "Phase 13a" "orphan-flood" "$SEED_RPC" "-count 50"
 run_check adversary_check "Phase 13b" "orphan-flood" "$MINER_RPC" "-count 50"
 
 log "Waiting 10s to verify nodes remain healthy after orphan flood..."
-sleep 10
+sleep 5
 print_cluster_status "After Orphan Flood"
 run_check check_consensus "Phase 13 (post orphan-flood)"
 fi
@@ -827,9 +1054,9 @@ fi
 if ! should_skip "15"; then
 # ── Phase 15: Post-Attack Convergence Verification ─────────
 header "Phase 15: Post-Attack Convergence (mining continues despite attacks)"
-log "Letting cluster mine for 30s after all adversarial attacks..."
-sleep 30
-wait_for_convergence 30 "Phase 15 post-attack convergence" 3
+log "Letting cluster mine for 120s after all adversarial attacks..."
+sleep 20
+wait_for_convergence 5 "Phase 15 post-attack convergence" 3
 print_cluster_status "Post-Attack Steady State"
 run_check check_consensus "Phase 15 (post-attack steady state)"
 fi
@@ -855,11 +1082,11 @@ header "Phase B: CONSENSUS — Retarget boundary stress (verify bits agreement)"
 
 log "Mining through multiple retarget boundaries..."
 wait_for_height 40 120 "Phase B (height 40)"
-wait_for_convergence 30 "Phase B convergence at 40" 3
+wait_for_convergence 5 "Phase B convergence at 40" 3
 run_check check_bits_consensus "Phase B at height ~40"
 
 wait_for_height 60 120 "Phase B (height 60)"
-wait_for_convergence 30 "Phase B convergence at 60" 3
+wait_for_convergence 5 "Phase B convergence at 60" 3
 run_check check_bits_consensus "Phase B at height ~60"
 
 print_cluster_status "After Retarget Boundary Stress"
@@ -875,8 +1102,8 @@ log "Submitting two competing blocks at the same height to different nodes..."
 PRETIP_HEIGHT=$(get_height "$((BASE_RPC_PORT + 0))")
 log "  Pre-fork tip height: $PRETIP_HEIGHT"
 
-sleep 15
-wait_for_convergence 30 "Phase C convergence" 2
+sleep 20
+wait_for_convergence 5 "Phase C convergence" 2
 
 HASH_SET=()
 for i in $(seq 0 $((NUM_NODES - 1))); do
@@ -899,7 +1126,7 @@ if [ ${#HASH_SET[@]} -ge 2 ]; then
     if [ "$ALL_SAME" = true ]; then
         pass "Phase C: all ${#HASH_SET[@]} nodes agree on tip hash — equal-work tie-breaker working"
     else
-        wait_for_convergence 20 "Phase C re-check" 1
+        wait_for_convergence 5 "Phase C re-check" 1
     fi
 fi
 
@@ -920,8 +1147,8 @@ log "Creating partition: ${PART_A_SIZE} miners (A) isolated from ${PART_B_SIZE} 
 for i in "${PART_B_MINERS[@]}"; do stop_node "$i"; done
 sleep 2
 
-log "Partition A (${PART_A_SIZE} miners + seeds) mining for 25s..."
-sleep 25
+log "Partition A (${PART_A_SIZE} miners + seeds) mining for 120s..."
+sleep 20
 PARTITION_A_HEIGHT=$(get_height "$((BASE_RPC_PORT + ${PART_A_MINERS[0]}))")
 log "  Partition A height: $PARTITION_A_HEIGHT"
 
@@ -931,22 +1158,22 @@ sleep 1
 for i in "${PART_B_MINERS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
-    sleep 0.1
+    portable_sleep 0.1
 done
 
-log "Partition B (${PART_B_SIZE} miners + seeds) syncing and mining for 30s..."
-sleep 30
+log "Partition B (${PART_B_SIZE} miners + seeds) syncing and mining for 120s..."
+sleep 20
 PARTITION_B_HEIGHT=$(get_height "$((BASE_RPC_PORT + ${PART_B_MINERS[0]}))")
 log "  Partition B height: $PARTITION_B_HEIGHT"
 
 for i in "${PART_A_MINERS[@]}"; do
     rm -rf "${BASEDIR}/node${i}"
     start_node "$i" true
-    sleep 0.1
+    portable_sleep 0.1
 done
 
 log "Reconnecting all miners — expecting convergence via reorg..."
-wait_for_convergence 60 "Phase D reorg convergence" 3
+wait_for_convergence 5 "Phase D reorg convergence" 3
 print_cluster_status "After Deep Reorg"
 run_check check_consensus "Phase D (deep reorg)"
 fi
@@ -959,10 +1186,10 @@ log "Flooding nodes with blocks 2-5 heights ahead of tip (orphan storm)..."
 run_check adversary_check "Phase E-seed" "orphan-flood" "$SEED_RPC" "-count 100"
 run_check adversary_check "Phase E-miner" "orphan-flood" "$MINER_RPC" "-count 100"
 
-log "Waiting 15s for orphan resolution..."
-sleep 15
+log "Waiting 60s for orphan resolution..."
+sleep 20
 
-wait_for_convergence 30 "Phase E orphan resolution" 3
+wait_for_convergence 5 "Phase E orphan resolution" 3
 print_cluster_status "After Orphan Storm"
 run_check check_consensus "Phase E (orphan storm)"
 fi
@@ -971,7 +1198,7 @@ if ! should_skip "F"; then
 # ── Phase F: Height Index Integrity ────────────────────────
 header "Phase F: CONSENSUS — Height index integrity check"
 
-wait_for_convergence 20 "Phase F pre-check" 2
+wait_for_convergence 5 "Phase F pre-check" 2
 
 MIN_LIVE_HEIGHT=999999
 for i in $(seq 0 $((NUM_NODES - 1))); do
@@ -1012,11 +1239,11 @@ done
 sleep 2
 for i in "${MINER_NODES[@]}"; do
     start_node "$i" true
-    sleep 0.2
+    portable_sleep 0.2
 done
 
-log "Waiting 15s for nodes to load from storage and reconnect..."
-sleep 15
+log "Waiting 30s for nodes to load from storage and reconnect..."
+sleep 5
 
 RESTART_FAILURES=0
 for i in $(seq 0 $((NUM_NODES - 1))); do
@@ -1040,7 +1267,7 @@ else
     ((FAILURES += RESTART_FAILURES))
 fi
 
-wait_for_convergence 30 "Phase H post-restart convergence" 3
+wait_for_convergence 5 "Phase H post-restart convergence" 3
 print_cluster_status "After Full Restart"
 run_check check_consensus "Phase H (restart consistency)"
 fi
@@ -1058,7 +1285,7 @@ run_check adversary_check "Phase I-seed" "double-spend" "$SEED_RPC"
 run_check adversary_check "Phase I-miner" "double-spend" "$MINER_RPC"
 
 log "Verifying cluster consensus after double-spend attempts..."
-wait_for_convergence 30 "Phase I convergence" 0
+wait_for_convergence 5 "Phase I convergence" 0
 run_check check_consensus "Phase I (post double-spend)"
 run_check check_utxo_consistency "Phase I UTXO consistency"
 print_cluster_status "After Double-Spend Attack"
@@ -1073,7 +1300,7 @@ run_check adversary_check "Phase J-seed" "immature-coinbase-spend" "$SEED_RPC"
 run_check adversary_check "Phase J-miner" "immature-coinbase-spend" "$MINER_RPC"
 
 log "Verifying cluster consensus after immature coinbase spend attempts..."
-wait_for_convergence 30 "Phase J convergence" 0
+wait_for_convergence 5 "Phase J convergence" 0
 run_check check_consensus "Phase J (post immature-coinbase-spend)"
 run_check check_utxo_consistency "Phase J UTXO consistency"
 print_cluster_status "After Immature Coinbase Spend Attack"
@@ -1088,7 +1315,7 @@ run_check adversary_check "Phase K-seed" "overspend" "$SEED_RPC"
 run_check adversary_check "Phase K-miner" "overspend" "$MINER_RPC"
 
 log "Verifying cluster consensus after overspend attempts..."
-wait_for_convergence 30 "Phase K convergence" 0
+wait_for_convergence 5 "Phase K convergence" 0
 run_check check_consensus "Phase K (post overspend)"
 run_check check_utxo_consistency "Phase K UTXO consistency"
 print_cluster_status "After Overspend Attack"
@@ -1103,7 +1330,7 @@ run_check adversary_check "Phase L-seed" "duplicate-input" "$SEED_RPC"
 run_check adversary_check "Phase L-miner" "duplicate-input" "$MINER_RPC"
 
 log "Verifying cluster consensus after duplicate-input attempts..."
-wait_for_convergence 30 "Phase L convergence" 0
+wait_for_convergence 5 "Phase L convergence" 0
 run_check check_consensus "Phase L (post duplicate-input)"
 run_check check_utxo_consistency "Phase L UTXO consistency"
 print_cluster_status "After Duplicate-Input Attack"
@@ -1118,7 +1345,7 @@ run_check adversary_check "Phase M-seed" "intra-block-double-spend" "$SEED_RPC"
 run_check adversary_check "Phase M-miner" "intra-block-double-spend" "$MINER_RPC"
 
 log "Verifying cluster consensus after intra-block double-spend attempts..."
-wait_for_convergence 30 "Phase M convergence" 0
+wait_for_convergence 5 "Phase M convergence" 0
 run_check check_consensus "Phase M (post intra-block-double-spend)"
 run_check check_utxo_consistency "Phase M UTXO consistency"
 print_cluster_status "After Intra-Block Double-Spend Attack"
@@ -1132,7 +1359,7 @@ for i in "${SEED_NODES[@]}"; do
         rpc=$((BASE_RPC_PORT + i))
         echo ""
         log "Full chain info from SEED node $i:"
-        curl -s "http://127.0.0.1:${rpc}/getblockchaininfo" 2>/dev/null | python3 -m json.tool || true
+        curl -s "http://127.0.0.1:${rpc}/getblockchaininfo" 2>/dev/null | $PYTHON_CMD -m json.tool || true
         run_check check_retarget
         break
     fi

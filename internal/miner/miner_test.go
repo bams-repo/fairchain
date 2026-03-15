@@ -56,7 +56,7 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 	}
 
 	mp := mempool.New(p, c.UtxoSet())
-	m := New(c, engine, mp, p, []byte{0x00}, nil)
+	m := New(c, engine, mp, p, []byte{0x00}, nil, nil)
 
 	return m, c, p
 }

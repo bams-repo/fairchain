@@ -213,7 +213,12 @@ func (m *Mempool) BlockTemplate() *BlockTemplateResult {
 	txs := make([]*types.Transaction, len(entries))
 	for i, e := range entries {
 		txs[i] = e.Tx
+		prev := totalFees
 		totalFees += e.Fee
+		if totalFees < prev {
+			totalFees = prev
+			break
+		}
 	}
 	return &BlockTemplateResult{Transactions: txs, TotalFees: totalFees}
 }

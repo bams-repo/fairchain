@@ -5,7 +5,15 @@ import (
 	"os"
 )
 
-var L *slog.Logger
+var (
+	L *slog.Logger
+
+	// DebugMode is set by the -debug CLI flag. When true, subsystems emit
+	// hyper-verbose diagnostic output covering block relay, peer topology,
+	// sync state, and message flow. This goes beyond slog.LevelDebug by
+	// enabling periodic dumps and per-message tracing.
+	DebugMode bool
+)
 
 func init() {
 	L = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -29,6 +37,15 @@ func Init(level string) {
 
 	L = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: lvl,
+	}))
+	slog.SetDefault(L)
+}
+
+// EnableDebug sets DebugMode and forces log level to debug.
+func EnableDebug() {
+	DebugMode = true
+	L = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
 	}))
 	slog.SetDefault(L)
 }

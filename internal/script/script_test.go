@@ -175,22 +175,20 @@ func TestIsLegacyUnvalidatedScript(t *testing.T) {
 	tests := []struct {
 		name   string
 		script []byte
-		want   bool
 	}{
-		{"nil", nil, true},
-		{"empty", []byte{}, true},
-		{"single zero byte", []byte{0x00}, true},
-		{"P2PKH", crypto.MakeP2PKHScript([20]byte{1, 2, 3}), false},
-		{"OP_RETURN", []byte{0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef}, false},
-		{"burn marker", []byte("burn:testnet:premine:v1"), false},
-		{"arbitrary", []byte("some random script"), false},
+		{"nil", nil},
+		{"empty", []byte{}},
+		{"single zero byte", []byte{0x00}},
+		{"P2PKH", crypto.MakeP2PKHScript([20]byte{1, 2, 3})},
+		{"OP_RETURN", []byte{0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef}},
+		{"burn marker", []byte("burn:testnet:premine:v1")},
+		{"arbitrary", []byte("some random script")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsLegacyUnvalidatedScript(tt.script)
-			if got != tt.want {
-				t.Errorf("IsLegacyUnvalidatedScript(%v) = %v, want %v", tt.script, got, tt.want)
+			if IsLegacyUnvalidatedScript(tt.script) {
+				t.Errorf("IsLegacyUnvalidatedScript(%v) = true, want false for all inputs", tt.script)
 			}
 		})
 	}

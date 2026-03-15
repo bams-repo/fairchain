@@ -10,6 +10,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/consensus/pow"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	fcparams "github.com/bams-repo/fairchain/internal/params"
+	"github.com/bams-repo/fairchain/internal/types"
 )
 
 func main() {
@@ -36,13 +37,25 @@ func main() {
 		Bits:            p.InitialBits,
 		Version:         1,
 		Reward:          p.InitialSubsidy,
-		RewardScript:    []byte{0x00}, // Placeholder script.
+		RewardScript:    []byte{0x00},
+	}
+
+	if p.Name == "testnet" {
+		cfg.ExtraOutputs = []types.TxOutput{
+			{
+				Value:    fcparams.TestnetPremineAmount,
+				PkScript: fcparams.TestnetBurnScript,
+			},
+		}
 	}
 
 	log.Printf("Building genesis block for %s...", p.Name)
 	log.Printf("  Bits:      0x%08x", cfg.Bits)
 	log.Printf("  Timestamp: %d", cfg.Timestamp)
 	log.Printf("  Message:   %q", string(cfg.CoinbaseMessage))
+	if len(cfg.ExtraOutputs) > 0 {
+		log.Printf("  Extra outputs: %d", len(cfg.ExtraOutputs))
+	}
 
 	block := fcparams.BuildGenesisBlock(cfg)
 

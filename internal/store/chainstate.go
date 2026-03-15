@@ -7,6 +7,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 // Chainstate key prefixes matching Bitcoin Core conventions.
@@ -114,6 +115,28 @@ func (wb *ChainstateWriteBatch) PutBestBlock(hash types.Hash) {
 // Flush atomically applies all batched operations.
 func (cs *ChainstateDB) Flush(wb *ChainstateWriteBatch) error {
 	return cs.db.Write(wb.batch, &opt.WriteOptions{Sync: true})
+}
+
+// ForEachUtxo iterates over all UTXO entries in the chainstate, calling fn
+// for each one. Used to populate the in-memory UTXO set on startup.
+func (cs *ChainstateDB) ForEachUtxo(fn func(txHash types.Hash, index uint32, data []byte) error) error {
+	iter := cs.db.NewIterator(util.BytesPrefix([]byte{prefixUTXO}), nil)
+	defer iter.Release()
+	for iter.Next() {
+		key := iter.Key()
+		if len(key) != 1+types.HashSize+4 {
+			continue
+		}
+		var txHash types.Hash
+		copy(txHash[:], key[1:1+types.HashSize])
+		idx := binary.LittleEndian.Uint32(key[1+types.HashSize:])
+		val := make([]byte, len(iter.Value()))
+		copy(val, iter.Value())
+		if err := fn(txHash, idx, val); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }
 
 // Count returns the number of UTXO entries (for diagnostics).

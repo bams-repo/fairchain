@@ -25,6 +25,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/store"
 	"github.com/bams-repo/fairchain/internal/timeadjust"
 	"github.com/bams-repo/fairchain/internal/types"
+	"github.com/bams-repo/fairchain/internal/version"
 	"github.com/bams-repo/fairchain/internal/wallet"
 )
 
@@ -33,15 +34,31 @@ func main() {
 	confPath := flag.String("conf", "", "Path to fairchain.conf (INI-style)")
 	network := flag.String("network", "", "Override network (mainnet/testnet/regtest)")
 	dataDir := flag.String("datadir", "", "Override data directory")
-	listen := flag.String("listen", "", "Override P2P listen address")
-	rpcAddr := flag.String("rpc", "", "Override RPC listen address")
+	listen := flag.String("listen", "", "Override P2P listen address (host:port)")
+	rpcBind := flag.String("rpcbind", "", "RPC bind address (default: 127.0.0.1)")
+	rpcPort := flag.String("rpcport", "", "RPC port (default: network-dependent)")
+	rpcAddr := flag.String("rpc", "", "Override full RPC address (host:port) — legacy flag")
 	mine := flag.Bool("mine", false, "Enable mining")
+	addNode := flag.String("addnode", "", "Add a peer to connect to (ip:port)")
 	seedPeers := flag.String("seed-peers", "", "Comma-separated seed peer addresses (ip:port,ip:port)")
+	connectPeers := flag.String("connect", "", "Connect ONLY to these peers (ip:port,ip:port) — disables all discovery")
+	noSeedNodes := flag.Bool("noseednode", false, "Suppress hardcoded seed nodes from chain params")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	debugFlag := flag.Bool("debug", false, "Enable hyper-verbose debug output (block relay, peer topology, sync state)")
+	noRPCAuth := flag.Bool("norpcauth", false, "Disable RPC authentication (testing/regtest only)")
 	migrateFlag := flag.Bool("migrate", false, "Migrate legacy blocks.db to new format")
+	printVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
+	if *printVersion {
+		fmt.Printf("Fairchain Daemon version v%s\n", version.String())
+		os.Exit(0)
+	}
+
 	logging.Init(*logLevel)
+	if *debugFlag {
+		logging.EnableDebug()
+	}
 	log := logging.L
 
 	// Load config: try fairchain.conf first, then JSON, then defaults.
@@ -89,14 +106,32 @@ func main() {
 	if *listen != "" {
 		cfg.ListenAddr = *listen
 	}
+	// RPC address: -rpc (legacy full addr) or -rpcbind/-rpcport (Bitcoin Core style).
 	if *rpcAddr != "" {
 		cfg.RPCAddr = *rpcAddr
+	} else if *rpcBind != "" || *rpcPort != "" {
+		host, port := "127.0.0.1", "19445"
+		if existing := cfg.RPCAddr; existing != "" {
+			if h, p, err := splitHostPort(existing); err == nil {
+				host, port = h, p
+			}
+		}
+		if *rpcBind != "" {
+			host = *rpcBind
+		}
+		if *rpcPort != "" {
+			port = *rpcPort
+		}
+		cfg.RPCAddr = host + ":" + port
 	}
 	if *mine {
 		cfg.MiningEnabled = true
 	}
+	if *addNode != "" {
+		cfg.SeedPeers = append(cfg.SeedPeers, *addNode)
+	}
 	if *seedPeers != "" {
-		cfg.SeedPeers = strings.Split(*seedPeers, ",")
+		cfg.SeedPeers = append(cfg.SeedPeers, strings.Split(*seedPeers, ",")...)
 	}
 
 	// Resolve chain params.
@@ -105,6 +140,7 @@ func main() {
 		log.Error("unknown network", "network", cfg.Network)
 		os.Exit(1)
 	}
+	cfg.DataDirName = params.DataDirName
 
 	// Mine and set genesis for the network.
 	initNetworkGenesis(params)
@@ -203,8 +239,16 @@ func main() {
 	// Context for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Build P2P options (Bitcoin Core parity: -connect, -noseednode).
+	p2pOpts := &p2p.ManagerOptions{
+		NoSeedNodes: *noSeedNodes,
+	}
+	if *connectPeers != "" {
+		p2pOpts.ConnectOnly = strings.Split(*connectPeers, ",")
+	}
+
 	// Start P2P manager.
-	p2pMgr := p2p.NewManager(params, bc, mp, peerStore, cfg.ListenAddr, cfg.MaxInbound, cfg.MaxOutbound, cfg.SeedPeers, adjClock)
+	p2pMgr := p2p.NewManager(params, bc, mp, peerStore, cfg.ListenAddr, cfg.MaxInbound, cfg.MaxOutbound, cfg.SeedPeers, adjClock, p2pOpts)
 
 	// Load peers.dat and merge into peer store.
 	store.LoadPeersDat(cfg.PeersDatPath(), peerStore)
@@ -217,8 +261,38 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start RPC server.
-	rpcServer := rpc.New(cfg.RPCAddr, bc, mp, p2pMgr, params)
+	// Initialize HD wallet.
+	hdWallet, err := wallet.NewHDWallet(cfg.WalletDir(), params.AddressPrefix)
+	if err != nil {
+		cancel()
+		p2pMgr.Stop()
+		peerStore.Close()
+		blockStore.Close()
+		log.Error("failed to initialize wallet", "error", err)
+		os.Exit(1)
+	}
+	defaultAddr := hdWallet.GetDefaultAddress()
+	log.Info("wallet loaded",
+		"address", defaultAddr,
+		"keys", hdWallet.KeyCount())
+
+	// Start RPC server with authentication.
+	var rpcAuth *rpc.AuthConfig
+	if !*noRPCAuth {
+		rpcAuth = &rpc.AuthConfig{
+			User:       cfg.RPCUser,
+			Password:   cfg.RPCPassword,
+			CookiePath: cfg.RPCCookiePath(),
+		}
+	}
+	rpcServer, err := rpc.New(cfg.RPCAddr, bc, mp, p2pMgr, params, rpcAuth)
+	if err != nil {
+		cancel()
+		logging.L.Error("failed to create RPC server", "error", err)
+		os.Exit(1)
+	}
+	rpcServer.SetWallet(hdWallet)
+	rpcServer.SetBroadcastTx(p2pMgr.BroadcastTx)
 	if err := rpcServer.Start(); err != nil {
 		cancel()
 		p2pMgr.Stop()
@@ -230,28 +304,26 @@ func main() {
 
 	// Start miner if enabled.
 	if cfg.MiningEnabled {
-		ks, err := wallet.LoadOrCreate(cfg.WalletDir())
-		if err != nil {
+		rewardScript := hdWallet.GetDefaultP2PKHScript()
+		if rewardScript == nil {
 			cancel()
 			p2pMgr.Stop()
 			rpcServer.Stop(context.Background())
 			peerStore.Close()
 			blockStore.Close()
-			log.Error("failed to load mining key", "error", err)
+			log.Error("wallet has no keys for mining reward")
 			os.Exit(1)
 		}
-		rewardScript := ks.P2PKHScript()
-		pkh := ks.PubKeyHash()
+		_, pkh := hdWallet.MiningKeyCompat()
 		log.Info("mining key loaded",
 			"pubkey_hash", fmt.Sprintf("%x", pkh[:]),
 			"script_len", len(rewardScript))
-		m := miner.New(bc, engine, mp, params, rewardScript, func(block *types.Block) {
+		m := miner.New(bc, engine, mp, params, rewardScript, adjClock, func(block *types.Block) {
 			height, err := bc.ProcessBlock(block)
 			if err != nil {
 				log.Warn("mined block rejected", "error", err)
 				return
 			}
-			// Remove confirmed transactions from mempool and update tip height.
 			var confirmedHashes []types.Hash
 			for _, tx := range block.Transactions {
 				txHash, hashErr := crypto.HashTransaction(&tx)
@@ -269,8 +341,13 @@ func main() {
 		go m.Run(ctx)
 	}
 
-	// Wait for shutdown signal.
+	// Wire up the "stop" RPC to trigger graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
+	rpcServer.SetShutdownFunc(func() {
+		sigCh <- syscall.SIGTERM
+	})
+
+	// Wait for shutdown signal.
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	log.Info("received shutdown signal", "signal", sig)
@@ -349,6 +426,14 @@ func initNetworkGenesis(p *fcparams.ChainParams) {
 	hash := crypto.HashBlockHeader(&block.Header)
 	fcparams.InitGenesis(p, block, hash)
 	logging.L.Info("genesis block", "hash", hash.ReverseString(), "nonce", block.Header.Nonce)
+}
+
+func splitHostPort(addr string) (string, string, error) {
+	idx := strings.LastIndex(addr, ":")
+	if idx < 0 {
+		return addr, "", fmt.Errorf("no port in %q", addr)
+	}
+	return addr[:idx], addr[idx+1:], nil
 }
 
 // migrateFromLegacy converts a legacy blocks.db to the new flat-file + LevelDB format.

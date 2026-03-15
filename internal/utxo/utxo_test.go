@@ -172,36 +172,62 @@ func TestEmptyUndoData(t *testing.T) {
 }
 
 func TestConnectGenesisBlock(t *testing.T) {
-	s := NewSet()
-
-	genesis := &types.Block{
-		Transactions: []types.Transaction{
-			{
-				Version: 1,
-				Inputs: []types.TxInput{
-					{
-						PreviousOutPoint: types.CoinbaseOutPoint,
-						SignatureScript:  []byte("genesis"),
-						Sequence:         0xFFFFFFFF,
+	t.Run("legacy placeholder excluded", func(t *testing.T) {
+		s := NewSet()
+		genesis := &types.Block{
+			Transactions: []types.Transaction{
+				{
+					Version: 1,
+					Inputs: []types.TxInput{
+						{
+							PreviousOutPoint: types.CoinbaseOutPoint,
+							SignatureScript:  []byte("genesis"),
+							Sequence:         0xFFFFFFFF,
+						},
+					},
+					Outputs: []types.TxOutput{
+						{Value: 5000000000, PkScript: []byte{0x00}},
 					},
 				},
-				Outputs: []types.TxOutput{
-					{Value: 5000000000, PkScript: []byte{0x00}},
+			},
+		}
+		if err := s.ConnectGenesis(genesis); err != nil {
+			t.Fatalf("ConnectGenesis: %v", err)
+		}
+		if s.Count() != 0 {
+			t.Fatalf("Count = %d, want 0 (legacy {0x00} should be excluded)", s.Count())
+		}
+	})
+
+	t.Run("real script included", func(t *testing.T) {
+		s := NewSet()
+		genesis := &types.Block{
+			Transactions: []types.Transaction{
+				{
+					Version: 1,
+					Inputs: []types.TxInput{
+						{
+							PreviousOutPoint: types.CoinbaseOutPoint,
+							SignatureScript:  []byte("genesis"),
+							Sequence:         0xFFFFFFFF,
+						},
+					},
+					Outputs: []types.TxOutput{
+						{Value: 5000000000, PkScript: []byte{0x76, 0xa9, 0x14, 0x01, 0x02, 0x03}},
+					},
 				},
 			},
-		},
-	}
-
-	if err := s.ConnectGenesis(genesis); err != nil {
-		t.Fatalf("ConnectGenesis: %v", err)
-	}
-
-	if s.Count() != 1 {
-		t.Fatalf("Count = %d, want 1", s.Count())
-	}
-	if s.TotalValue() != 5000000000 {
-		t.Fatalf("TotalValue = %d, want 5000000000", s.TotalValue())
-	}
+		}
+		if err := s.ConnectGenesis(genesis); err != nil {
+			t.Fatalf("ConnectGenesis: %v", err)
+		}
+		if s.Count() != 1 {
+			t.Fatalf("Count = %d, want 1", s.Count())
+		}
+		if s.TotalValue() != 5000000000 {
+			t.Fatalf("TotalValue = %d, want 5000000000", s.TotalValue())
+		}
+	})
 }
 
 func TestConnectBlockAtomicOnFailure(t *testing.T) {

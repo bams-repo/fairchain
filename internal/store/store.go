@@ -37,6 +37,7 @@ type BlockStore interface {
 	GetBestBlock() (types.Hash, error)
 	PutBestBlock(hash types.Hash) error
 	UtxoCount() (int, error)
+	ForEachUtxo(fn func(txHash types.Hash, index uint32, data []byte) error) error
 
 	// Legacy compatibility: read a full block by hash (uses index + flat file).
 	GetBlock(hash types.Hash) (*types.Block, error)

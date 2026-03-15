@@ -23,7 +23,12 @@ const (
 	OpReturn      = 0x6a
 )
 
-const maxStackSize = 1000
+const (
+	maxStackSize      = 1000
+	maxScriptSize     = 10000 // Bitcoin consensus limit.
+	maxOpsPerScript   = 201   // Bitcoin limit on non-push opcodes per script.
+	maxStackElemSize  = 520   // Bitcoin limit on individual stack element size.
+)
 
 // Verify executes the combined script (sigScript + pkScript) and returns nil
 // if the spend is authorized. This is the consensus-critical entry point.
@@ -71,6 +76,13 @@ func Verify(sigScript, pkScript []byte, tx *types.Transaction, inputIdx int) err
 		return fmt.Errorf("script evaluated to false")
 	}
 
+	// Cleanstack: exactly one element must remain after execution.
+	// This prevents non-canonical transaction forms and matches Bitcoin's
+	// SCRIPT_VERIFY_CLEANSTACK behavior.
+	if vm.stack.size() != 1 {
+		return fmt.Errorf("cleanstack violation: %d items remain on stack (expected 1)", vm.stack.size())
+	}
+
 	return nil
 }
 
@@ -82,20 +94,35 @@ type engine struct {
 }
 
 func (e *engine) execute(script []byte) error {
+	if len(script) > maxScriptSize {
+		return fmt.Errorf("script size %d exceeds maximum %d", len(script), maxScriptSize)
+	}
+
+	var numOps int
 	pos := 0
 	for pos < len(script) {
 		op := script[pos]
 		pos++
+
+		// Count non-push opcodes toward the per-script limit.
+		if op > OpPushData2 {
+			numOps++
+			if numOps > maxOpsPerScript {
+				return fmt.Errorf("exceeded maximum opcode count (%d)", maxOpsPerScript)
+			}
+		}
 
 		switch {
 		case op == OpFalse:
 			e.stack.push([]byte{})
 
 		case op >= 0x01 && op <= 0x4b:
-			// Direct data push: op is the number of bytes to push.
 			n := int(op)
 			if pos+n > len(script) {
 				return fmt.Errorf("push %d bytes: script too short at offset %d", n, pos)
+			}
+			if n > maxStackElemSize {
+				return fmt.Errorf("push size %d exceeds maximum element size %d", n, maxStackElemSize)
 			}
 			data := make([]byte, n)
 			copy(data, script[pos:pos+n])
@@ -111,10 +138,33 @@ func (e *engine) execute(script []byte) error {
 			if pos+n > len(script) {
 				return fmt.Errorf("OP_PUSHDATA1: script too short")
 			}
+			if n > maxStackElemSize {
+				return fmt.Errorf("OP_PUSHDATA1: push size %d exceeds maximum element size %d", n, maxStackElemSize)
+			}
 			data := make([]byte, n)
 			copy(data, script[pos:pos+n])
 			e.stack.push(data)
 			pos += n
+
+		case op == OpPushData2:
+			if pos+2 > len(script) {
+				return fmt.Errorf("OP_PUSHDATA2: missing length bytes")
+			}
+			n := int(script[pos]) | int(script[pos+1])<<8
+			pos += 2
+			if pos+n > len(script) {
+				return fmt.Errorf("OP_PUSHDATA2: script too short")
+			}
+			if n > maxStackElemSize {
+				return fmt.Errorf("OP_PUSHDATA2: push size %d exceeds maximum element size %d", n, maxStackElemSize)
+			}
+			data := make([]byte, n)
+			copy(data, script[pos:pos+n])
+			e.stack.push(data)
+			pos += n
+
+		case op == Op1:
+			e.stack.push([]byte{1})
 
 		case op == OpDup:
 			if e.stack.size() < 1 {
@@ -253,9 +303,16 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
+// isTrue implements Bitcoin's CastToBool: a byte vector is false if it is
+// empty, all zeros, or negative zero (0x80 in the last byte with all other
+// bytes zero). Everything else is true.
 func isTrue(data []byte) bool {
-	for _, b := range data {
+	for i, b := range data {
 		if b != 0 {
+			// Negative zero: last byte is 0x80, all preceding bytes are 0x00.
+			if i == len(data)-1 && b == 0x80 {
+				return false
+			}
 			return true
 		}
 	}
@@ -274,19 +331,10 @@ func IsStandardScript(pkScript []byte) bool {
 	return false
 }
 
-// IsLegacyUnvalidatedScript returns true if the script predates the script
-// validation activation and should be skipped during script verification.
-// These are genesis-era placeholder scripts (single byte {0x00}) used before
-// real P2PKH was implemented. They are anyone-can-spend by convention during
-// the transition period.
+// IsLegacyUnvalidatedScript always returns false. Legacy placeholder scripts
+// ({0x00}) are excluded from the UTXO set at genesis insertion time, so they
+// should never appear. If one is encountered, the script engine will reject
+// it (OP_FALSE leaves false on stack), making it unspendable by design.
 func IsLegacyUnvalidatedScript(pkScript []byte) bool {
-	if len(pkScript) == 0 {
-		return true
-	}
-	// Single-byte {0x00} was the placeholder used for genesis and early
-	// coinbase outputs before P2PKH was implemented.
-	if len(pkScript) == 1 && pkScript[0] == 0x00 {
-		return true
-	}
 	return false
 }

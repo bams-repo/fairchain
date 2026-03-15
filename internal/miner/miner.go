@@ -14,6 +14,15 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
+// TimeSource provides network-adjusted time for block timestamp construction.
+type TimeSource interface {
+	Now() int64
+}
+
+type localClock struct{}
+
+func (localClock) Now() int64 { return time.Now().Unix() }
+
 // Miner builds block templates and searches for valid PoW solutions.
 type Miner struct {
 	chain        *chain.Chain
@@ -21,17 +30,22 @@ type Miner struct {
 	mempool      *mempool.Mempool
 	params       *params.ChainParams
 	rewardScript []byte
+	timeSource   TimeSource
 	onBlock      func(*types.Block)
 }
 
-// New creates a new Miner.
-func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, onBlock func(*types.Block)) *Miner {
+// New creates a new Miner. ts may be nil, in which case raw local time is used.
+func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, ts TimeSource, onBlock func(*types.Block)) *Miner {
+	if ts == nil {
+		ts = localClock{}
+	}
 	return &Miner{
 		chain:        c,
 		engine:       e,
 		mempool:      mp,
 		params:       p,
 		rewardScript: rewardScript,
+		timeSource:   ts,
 		onBlock:      onBlock,
 	}
 }
@@ -97,7 +111,7 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 		return nil, fmt.Errorf("compute merkle root: %w", err)
 	}
 
-	ts := uint32(time.Now().Unix())
+	ts := uint32(m.timeSource.Now())
 	if ts <= tipHeader.Timestamp {
 		ts = tipHeader.Timestamp + 1
 	}
@@ -139,7 +153,7 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 		}
 
 		if header.Nonce == 0 {
-			now := uint32(time.Now().Unix())
+			now := uint32(m.timeSource.Now())
 			if now <= tipHeader.Timestamp {
 				now = tipHeader.Timestamp + 1
 			}
@@ -151,9 +165,13 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 }
 
 func (m *Miner) buildCoinbase(height uint32, subsidy uint64) types.Transaction {
+	// BIP34: encode height as a CScript push — [pushLen][height LE bytes][tag].
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, height)
-	msg := append(heightBytes, []byte("fairchain")...)
+	msg := make([]byte, 0, 1+4+len("fairchain"))
+	msg = append(msg, 0x04) // push 4 bytes
+	msg = append(msg, heightBytes...)
+	msg = append(msg, []byte("fairchain")...)
 
 	return types.Transaction{
 		Version: 1,

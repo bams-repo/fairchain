@@ -154,6 +154,11 @@ func (fs *FileStore) UtxoCount() (int, error) {
 	return fs.chainstate.Count()
 }
 
+// ForEachUtxo iterates over all UTXO entries in the chainstate.
+func (fs *FileStore) ForEachUtxo(fn func(txHash types.Hash, index uint32, data []byte) error) error {
+	return fs.chainstate.ForEachUtxo(fn)
+}
+
 // GetBlock retrieves a full block by hash using the index + flat files.
 func (fs *FileStore) GetBlock(hash types.Hash) (*types.Block, error) {
 	rec, err := fs.index.GetBlockIndex(hash)

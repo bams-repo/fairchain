@@ -33,21 +33,21 @@ jobs:
           mkdir -p dist
           mkdir -p dist/bundle-linux-amd64 dist/bundle-windows-amd64 dist/bundle-macos-amd64
 
-          GOOS=linux GOARCH=amd64 go build -o dist/bundle-linux-amd64/fairchain-node ./cmd/node
+          GOOS=linux GOARCH=amd64 go build -o dist/bundle-linux-amd64/fairchaind ./cmd/node
           GOOS=linux GOARCH=amd64 go build -o dist/bundle-linux-amd64/fairchain-cli ./cmd/cli
 
-          GOOS=windows GOARCH=amd64 go build -o dist/bundle-windows-amd64/fairchain-node.exe ./cmd/node
+          GOOS=windows GOARCH=amd64 go build -o dist/bundle-windows-amd64/fairchaind.exe ./cmd/node
           GOOS=windows GOARCH=amd64 go build -o dist/bundle-windows-amd64/fairchain-cli.exe ./cmd/cli
 
-          GOOS=darwin GOARCH=amd64 go build -o dist/bundle-macos-amd64/fairchain-node ./cmd/node
+          GOOS=darwin GOARCH=amd64 go build -o dist/bundle-macos-amd64/fairchaind ./cmd/node
           GOOS=darwin GOARCH=amd64 go build -o dist/bundle-macos-amd64/fairchain-cli ./cmd/cli
 
           cp scripts/chaos_test.py dist/bundle-linux-amd64/chaos_test.py
           cp scripts/chaos_test.py dist/bundle-windows-amd64/chaos_test.py
           cp scripts/chaos_test.py dist/bundle-macos-amd64/chaos_test.py
 
-          chmod +x dist/bundle-linux-amd64/fairchain-node dist/bundle-linux-amd64/fairchain-cli dist/bundle-linux-amd64/chaos_test.py
-          chmod +x dist/bundle-macos-amd64/fairchain-node dist/bundle-macos-amd64/fairchain-cli dist/bundle-macos-amd64/chaos_test.py
+          chmod +x dist/bundle-linux-amd64/fairchaind dist/bundle-linux-amd64/fairchain-cli dist/bundle-linux-amd64/chaos_test.py
+          chmod +x dist/bundle-macos-amd64/fairchaind dist/bundle-macos-amd64/fairchain-cli dist/bundle-macos-amd64/chaos_test.py
 
           tar -C dist -czf dist/fairchain-linux-amd64.tar.gz bundle-linux-amd64
           tar -C dist -czf dist/fairchain-windows-amd64.tar.gz bundle-windows-amd64

@@ -10,15 +10,20 @@ import (
 
 func makeTestBlock(height uint32, p *params.ChainParams) types.Block {
 	subsidy := p.CalcSubsidy(height)
+	// BIP34 format: [pushLen=0x04][height LE 4 bytes][tag]
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, height)
+	scriptSig := make([]byte, 0, 1+4+len("test"))
+	scriptSig = append(scriptSig, 0x04)
+	scriptSig = append(scriptSig, heightBytes...)
+	scriptSig = append(scriptSig, []byte("test")...)
 
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
 			{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  append(heightBytes, []byte("test")...),
+				SignatureScript:  scriptSig,
 				Sequence:         0xFFFFFFFF,
 			},
 		},

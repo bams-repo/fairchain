@@ -17,6 +17,10 @@ type Config struct {
 	// DataDir is the root directory for all node data.
 	DataDir string `json:"data_dir"`
 
+	// DataDirName overrides the network subdirectory name (e.g. "testnet2").
+	// Set from ChainParams.DataDirName after params are resolved.
+	DataDirName string `json:"-"`
+
 	// ListenAddr is the TCP address to listen on for P2P connections.
 	ListenAddr string `json:"listen_addr"`
 
@@ -40,6 +44,13 @@ type Config struct {
 
 	// LogLevel controls logging verbosity: "debug", "info", "warn", "error".
 	LogLevel string `json:"log_level"`
+
+	// RPCUser is the username for HTTP Basic Auth on the RPC server.
+	// If both RPCUser and RPCPassword are empty, a random cookie file is generated.
+	RPCUser string `json:"rpc_user,omitempty"`
+
+	// RPCPassword is the password for HTTP Basic Auth on the RPC server.
+	RPCPassword string `json:"rpc_password,omitempty"`
 }
 
 // DefaultConfig returns a config with sensible defaults for regtest.
@@ -174,22 +185,21 @@ func applyConfOption(cfg *Config, key, val string) {
 		fmt.Sscanf(val, "%d", &cfg.MaxOutbound)
 	case "seedpeers":
 		cfg.SeedPeers = strings.Split(val, ",")
+	case "rpcuser":
+		cfg.RPCUser = val
+	case "rpcpassword":
+		cfg.RPCPassword = val
 	}
 }
 
 // NetworkDataDir returns the network-specific data directory.
-// Bitcoin Core convention: mainnet uses the root, others get a subdirectory.
+// Bitcoin Core convention: mainnet uses the root, others get a subdirectory
+// whose name is controlled by ChainParams.DataDirName (e.g. "testnet2").
 func (c *Config) NetworkDataDir() string {
-	switch c.Network {
-	case "mainnet":
+	if c.DataDirName == "" {
 		return c.DataDir
-	case "testnet":
-		return filepath.Join(c.DataDir, "testnet")
-	case "regtest":
-		return filepath.Join(c.DataDir, "regtest")
-	default:
-		return filepath.Join(c.DataDir, c.Network)
 	}
+	return filepath.Join(c.DataDir, c.DataDirName)
 }
 
 // BlocksDir returns the path to the blocks/ directory (blk*.dat, rev*.dat).
@@ -225,6 +235,11 @@ func (c *Config) MempoolPath() string {
 // LockFilePath returns the path to the .lock file.
 func (c *Config) LockFilePath() string {
 	return filepath.Join(c.NetworkDataDir(), ".lock")
+}
+
+// RPCCookiePath returns the path to the .cookie file for RPC auth.
+func (c *Config) RPCCookiePath() string {
+	return filepath.Join(c.NetworkDataDir(), ".cookie")
 }
 
 // ConfFilePath returns the path to fairchain.conf in the data directory root.

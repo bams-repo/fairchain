@@ -1,10 +1,15 @@
 # Binaries
 bin/
+/node
 /adversary
 *.exe
 *.dll
 *.so
 *.dylib
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Go build cache
 *.test

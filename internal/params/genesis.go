@@ -15,11 +15,20 @@ type GenesisConfig struct {
 	Version         uint32   // Block version.
 	Reward          uint64   // Coinbase reward value.
 	RewardScript    []byte   // PkScript for the coinbase output (recipient placeholder).
+	ExtraOutputs    []types.TxOutput // Additional coinbase outputs (e.g., premine burn).
 }
 
 // BuildGenesisBlock constructs a genesis block from config.
 // The nonce is set to 0; the caller must mine it to find a valid nonce.
 func BuildGenesisBlock(cfg GenesisConfig) types.Block {
+	outputs := []types.TxOutput{
+		{
+			Value:    cfg.Reward,
+			PkScript: cfg.RewardScript,
+		},
+	}
+	outputs = append(outputs, cfg.ExtraOutputs...)
+
 	coinbaseTx := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
@@ -29,12 +38,7 @@ func BuildGenesisBlock(cfg GenesisConfig) types.Block {
 				Sequence:         0xFFFFFFFF,
 			},
 		},
-		Outputs: []types.TxOutput{
-			{
-				Value:    cfg.Reward,
-				PkScript: cfg.RewardScript,
-			},
-		},
+		Outputs:  outputs,
 		LockTime: 0,
 	}
 

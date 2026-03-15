@@ -12,17 +12,23 @@ import (
 func makeTestParams() *params.ChainParams {
 	p := &params.ChainParams{}
 	*p = *params.Regtest
+	p.ActivationHeights = map[string]uint32{}
 	return p
 }
 
 func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
+	// BIP34 format: [pushLen=0x04][height LE 4 bytes][tag]
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, height)
+	scriptSig := make([]byte, 0, 1+4+len("test"))
+	scriptSig = append(scriptSig, 0x04)
+	scriptSig = append(scriptSig, heightBytes...)
+	scriptSig = append(scriptSig, []byte("test")...)
 	return types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte("test")...),
+			SignatureScript:  scriptSig,
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{
@@ -32,10 +38,57 @@ func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
 	}
 }
 
-func addUTXO(s *utxo.Set, hash types.Hash, index uint32, value uint64, height uint32, isCoinbase bool) {
+func bip34ScriptSig(height uint32, tag string) []byte {
+	heightBytes := make([]byte, 4)
+	types.PutUint32LE(heightBytes, height)
+	s := make([]byte, 0, 1+4+len(tag))
+	s = append(s, 0x04)
+	s = append(s, heightBytes...)
+	s = append(s, []byte(tag)...)
+	return s
+}
+
+// testKeyPair holds a keypair for use in tests that need script validation.
+type testKeyPair struct {
+	pkScript []byte
+	privKey  interface{ Serialize() []byte }
+}
+
+// newTestKeyPair generates a fresh keypair and returns its P2PKH script.
+func newTestKeyPair(t *testing.T) testKeyPair {
+	t.Helper()
+	privBytes, pubBytes, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privKey, err := crypto.PrivKeyFromBytes(privBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testKeyPair{
+		pkScript: crypto.MakeP2PKHScriptFromPubKey(pubBytes),
+		privKey:  privKey,
+	}
+}
+
+// signTxInput signs a single input of a transaction using the test keypair.
+func signTxInput(t *testing.T, tx *types.Transaction, inputIdx int, kp testKeyPair) {
+	t.Helper()
+	privKey, err := crypto.PrivKeyFromBytes(kp.privKey.Serialize())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigScript, err := crypto.SignInput(tx, inputIdx, kp.pkScript, privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Inputs[inputIdx].SignatureScript = sigScript
+}
+
+func addUTXO(s *utxo.Set, hash types.Hash, index uint32, value uint64, height uint32, isCoinbase bool, pkScript []byte) {
 	s.Add(hash, index, &utxo.UtxoEntry{
 		Value:      value,
-		PkScript:   []byte{0x00},
+		PkScript:   pkScript,
 		Height:     height,
 		IsCoinbase: isCoinbase,
 	})
@@ -62,13 +115,11 @@ func TestValidateTransactionInputs_ScriptValidation_RejectsStealUTXO(t *testing.
 	height := uint32(200)
 	subsidy := p.CalcSubsidy(height)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte("test")...),
+			SignatureScript:  bip34ScriptSig(height, "test"),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{Value: subsidy + 100, PkScript: []byte{0x00}}},
@@ -122,13 +173,11 @@ func TestValidateTransactionInputs_ScriptValidation_AcceptsValidSig(t *testing.T
 	subsidy := p.CalcSubsidy(height)
 	fee := uint64(100)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte("test")...),
+			SignatureScript:  bip34ScriptSig(height, "test"),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{Value: subsidy + fee, PkScript: []byte{0x00}}},
@@ -179,13 +228,11 @@ func TestValidateTransactionInputs_ScriptValidation_RejectsBurnSpend(t *testing.
 	height := uint32(100)
 	subsidy := p.CalcSubsidy(height)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte("test")...),
+			SignatureScript:  bip34ScriptSig(height, "test"),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{Value: subsidy + 1000, PkScript: []byte{0x00}}},
@@ -215,7 +262,7 @@ func TestValidateTransactionInputs_ScriptValidation_RejectsBurnSpend(t *testing.
 	t.Logf("steal-premine correctly rejected at consensus level: %v", err)
 }
 
-func TestValidateTransactionInputs_LegacyScriptSkipped(t *testing.T) {
+func TestValidateTransactionInputs_LegacyScriptRejected(t *testing.T) {
 	p := params.Regtest
 
 	legacyScript := []byte{0x00}
@@ -232,13 +279,11 @@ func TestValidateTransactionInputs_LegacyScriptSkipped(t *testing.T) {
 	height := uint32(10)
 	subsidy := p.CalcSubsidy(height)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte("test")...),
+			SignatureScript:  bip34ScriptSig(height, "test"),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{Value: subsidy + 100, PkScript: []byte{0x00}}},
@@ -258,13 +303,11 @@ func TestValidateTransactionInputs_LegacyScriptSkipped(t *testing.T) {
 		Transactions: []types.Transaction{coinbase, spendTx},
 	}
 
-	fees, err := ValidateTransactionInputs(block, utxoSet, height, p)
-	if err != nil {
-		t.Fatalf("legacy script should be skipped during validation: %v", err)
+	_, err := ValidateTransactionInputs(block, utxoSet, height, p)
+	if err == nil {
+		t.Fatal("legacy {0x00} script should now be rejected by script validation")
 	}
-	if fees != 100 {
-		t.Fatalf("fees: got %d, want 100", fees)
-	}
+	t.Logf("legacy script correctly rejected: %v", err)
 }
 
 func TestValidateSingleTransaction_ScriptValidation_RejectsSteal(t *testing.T) {
@@ -351,10 +394,11 @@ func TestValidateSingleTransaction_ScriptValidation_AcceptsValid(t *testing.T) {
 func TestDoubleSpendWithinBlock(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -375,6 +419,8 @@ func TestDoubleSpendWithinBlock(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+	signTxInput(t, &block.Transactions[2], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -385,10 +431,11 @@ func TestDoubleSpendWithinBlock(t *testing.T) {
 func TestDuplicateInputsWithinTransaction(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -403,6 +450,8 @@ func TestDuplicateInputsWithinTransaction(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+	signTxInput(t, &block.Transactions[1], 1, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -413,10 +462,11 @@ func TestDuplicateInputsWithinTransaction(t *testing.T) {
 func TestOverspendTransaction(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -430,6 +480,7 @@ func TestOverspendTransaction(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -440,12 +491,13 @@ func TestOverspendTransaction(t *testing.T) {
 func TestImmatureCoinbaseSpend(t *testing.T) {
 	p := makeTestParams()
 	p.CoinbaseMaturity = 10
+	kp := newTestKeyPair(t)
 
 	s := utxo.NewSet()
 
 	var cbHash types.Hash
 	cbHash[0] = 0xCB
-	addUTXO(s, cbHash, 0, 5000000000, 5, true)
+	addUTXO(s, cbHash, 0, 5000000000, 5, true, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -459,6 +511,7 @@ func TestImmatureCoinbaseSpend(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 8, p)
 	if err == nil {
@@ -469,12 +522,13 @@ func TestImmatureCoinbaseSpend(t *testing.T) {
 func TestMatureCoinbaseSpendAccepted(t *testing.T) {
 	p := makeTestParams()
 	p.CoinbaseMaturity = 10
+	kp := newTestKeyPair(t)
 
 	s := utxo.NewSet()
 
 	var cbHash types.Hash
 	cbHash[0] = 0xCB
-	addUTXO(s, cbHash, 0, 5000000000, 5, true)
+	addUTXO(s, cbHash, 0, 5000000000, 5, true, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -488,6 +542,7 @@ func TestMatureCoinbaseSpendAccepted(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 20, p)
 	if err != nil {
@@ -516,10 +571,11 @@ func TestInvalidCoinbaseReward(t *testing.T) {
 func TestCoinbaseRewardWithFees(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	subsidy := p.CalcSubsidy(5)
 	fee := uint64(100)
@@ -536,6 +592,7 @@ func TestCoinbaseRewardWithFees(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err != nil {
@@ -546,10 +603,11 @@ func TestCoinbaseRewardWithFees(t *testing.T) {
 func TestCoinbaseExceedingSubsidyPlusFees(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	subsidy := p.CalcSubsidy(5)
 	fee := uint64(100)
@@ -566,6 +624,7 @@ func TestCoinbaseExceedingSubsidyPlusFees(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -602,14 +661,15 @@ func TestNonexistentUTXOReference(t *testing.T) {
 func TestBlockWithConflictingTransactions(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	var txHash2 types.Hash
 	txHash2[0] = 0x02
-	addUTXO(s, txHash2, 0, 2000, 0, false)
+	addUTXO(s, txHash2, 0, 2000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -631,6 +691,9 @@ func TestBlockWithConflictingTransactions(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+	signTxInput(t, &block.Transactions[1], 1, kp)
+	signTxInput(t, &block.Transactions[2], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -641,10 +704,11 @@ func TestBlockWithConflictingTransactions(t *testing.T) {
 func TestZeroValueOutputRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -660,6 +724,7 @@ func TestZeroValueOutputRejected(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -671,15 +736,13 @@ func TestZeroValueCoinbaseOutputRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, 5)
 	block := &types.Block{
 		Transactions: []types.Transaction{
 			{
 				Version: 1,
 				Inputs: []types.TxInput{{
 					PreviousOutPoint: types.CoinbaseOutPoint,
-					SignatureScript:  append(heightBytes, []byte("test")...),
+					SignatureScript:  bip34ScriptSig(5, "test"),
 					Sequence:         0xFFFFFFFF,
 				}},
 				Outputs: []types.TxOutput{
@@ -719,10 +782,11 @@ func TestNoInputsNonCoinbaseRejected(t *testing.T) {
 func TestNoOutputsNonCoinbaseRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	block := &types.Block{
 		Transactions: []types.Transaction{
@@ -736,6 +800,7 @@ func TestNoOutputsNonCoinbaseRejected(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	_, err := ValidateTransactionInputs(block, s, 5, p)
 	if err == nil {
@@ -746,10 +811,11 @@ func TestNoOutputsNonCoinbaseRejected(t *testing.T) {
 func TestValidBlockAccepted(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 5000, 0, false)
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
 
 	subsidy := p.CalcSubsidy(5)
 	fee := uint64(500)
@@ -769,6 +835,7 @@ func TestValidBlockAccepted(t *testing.T) {
 			},
 		},
 	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
 
 	fees, err := ValidateTransactionInputs(block, s, 5, p)
 	if err != nil {
@@ -782,10 +849,11 @@ func TestValidBlockAccepted(t *testing.T) {
 func TestSingleTxDuplicateInputRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	tx := &types.Transaction{
 		Version: 1,
@@ -795,6 +863,8 @@ func TestSingleTxDuplicateInputRejected(t *testing.T) {
 		},
 		Outputs: []types.TxOutput{{Value: 500, PkScript: []byte{0x01}}},
 	}
+	signTxInput(t, tx, 0, kp)
+	signTxInput(t, tx, 1, kp)
 
 	_, err := ValidateSingleTransaction(tx, s, 4, p)
 	if err == nil {
@@ -805,10 +875,11 @@ func TestSingleTxDuplicateInputRejected(t *testing.T) {
 func TestSingleTxZeroValueOutputRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	tx := &types.Transaction{
 		Version: 1,
@@ -817,6 +888,7 @@ func TestSingleTxZeroValueOutputRejected(t *testing.T) {
 		},
 		Outputs: []types.TxOutput{{Value: 0, PkScript: []byte{0x01}}},
 	}
+	signTxInput(t, tx, 0, kp)
 
 	_, err := ValidateSingleTransaction(tx, s, 4, p)
 	if err == nil {
@@ -827,10 +899,11 @@ func TestSingleTxZeroValueOutputRejected(t *testing.T) {
 func TestSingleTxOverspendRejected(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 1000, 0, false)
+	addUTXO(s, txHash1, 0, 1000, 0, false, kp.pkScript)
 
 	tx := &types.Transaction{
 		Version: 1,
@@ -839,6 +912,7 @@ func TestSingleTxOverspendRejected(t *testing.T) {
 		},
 		Outputs: []types.TxOutput{{Value: 9999, PkScript: []byte{0x01}}},
 	}
+	signTxInput(t, tx, 0, kp)
 
 	_, err := ValidateSingleTransaction(tx, s, 4, p)
 	if err == nil {
@@ -870,12 +944,13 @@ func TestSingleTxMissingUTXORejected(t *testing.T) {
 func TestSingleTxImmatureCoinbaseRejected(t *testing.T) {
 	p := makeTestParams()
 	p.CoinbaseMaturity = 10
+	kp := newTestKeyPair(t)
 
 	s := utxo.NewSet()
 
 	var cbHash types.Hash
 	cbHash[0] = 0xCB
-	addUTXO(s, cbHash, 0, 5000000000, 5, true)
+	addUTXO(s, cbHash, 0, 5000000000, 5, true, kp.pkScript)
 
 	tx := &types.Transaction{
 		Version: 1,
@@ -884,6 +959,7 @@ func TestSingleTxImmatureCoinbaseRejected(t *testing.T) {
 		},
 		Outputs: []types.TxOutput{{Value: 1000, PkScript: []byte{0x01}}},
 	}
+	signTxInput(t, tx, 0, kp)
 
 	_, err := ValidateSingleTransaction(tx, s, 7, p)
 	if err == nil {
@@ -894,10 +970,11 @@ func TestSingleTxImmatureCoinbaseRejected(t *testing.T) {
 func TestSingleTxValidAccepted(t *testing.T) {
 	p := makeTestParams()
 	s := utxo.NewSet()
+	kp := newTestKeyPair(t)
 
 	var txHash1 types.Hash
 	txHash1[0] = 0x01
-	addUTXO(s, txHash1, 0, 5000, 0, false)
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
 
 	tx := &types.Transaction{
 		Version: 1,
@@ -909,6 +986,7 @@ func TestSingleTxValidAccepted(t *testing.T) {
 			{Value: 1500, PkScript: []byte{0x02}},
 		},
 	}
+	signTxInput(t, tx, 0, kp)
 
 	fee, err := ValidateSingleTransaction(tx, s, 4, p)
 	if err != nil {

@@ -73,13 +73,14 @@ func mineBlock(t *testing.T, c *Chain, p *fcparams.ChainParams) *types.Block {
 
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, newHeight)
+	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte("test")...)
 
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
 			{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  append(heightBytes, []byte("test")...),
+				SignatureScript:  scriptSig,
 				Sequence:         0xFFFFFFFF,
 			},
 		},
@@ -122,13 +123,14 @@ func mineBlockOnParent(t *testing.T, parentHash types.Hash, parentHeader *types.
 
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, newHeight)
+	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte(tag)...)
 
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
 			{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  append(heightBytes, []byte(tag)...),
+				SignatureScript:  scriptSig,
 				Sequence:         0xFFFFFFFF,
 			},
 		},
@@ -234,10 +236,11 @@ func TestChainOrphan(t *testing.T) {
 	block1Hash := crypto.HashBlockHeader(&block1.Header)
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, 2)
+	scriptSig2 := append(append([]byte{0x04}, heightBytes...), []byte("test")...)
 	coinbase2 := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
-			{PreviousOutPoint: types.CoinbaseOutPoint, SignatureScript: append(heightBytes, []byte("test")...), Sequence: 0xFFFFFFFF},
+			{PreviousOutPoint: types.CoinbaseOutPoint, SignatureScript: scriptSig2, Sequence: 0xFFFFFFFF},
 		},
 		Outputs: []types.TxOutput{
 			{Value: p.CalcSubsidy(2), PkScript: []byte{0x00}},
@@ -477,12 +480,13 @@ func mineBlockWithTimestamp(t *testing.T, parentHash types.Hash, parentHeader *t
 
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, newHeight)
+	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte(tag)...)
 
 	coinbase := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(heightBytes, []byte(tag)...),
+			SignatureScript:  scriptSig,
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{

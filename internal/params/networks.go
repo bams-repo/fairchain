@@ -7,23 +7,25 @@ import (
 )
 
 const (
-	// Base-unit representation of ~20,999,999.9769 coin cap.
-	baseMaxSupply = 2_099_999_997_690_000
+	// MaxMoneyValue is the maximum number of base units that can ever exist.
+	// No single transaction output may exceed this value.
+	MaxMoneyValue = 2_099_999_997_690_000
 
 	// 20% premine on top of mined supply for testnet.
-	testnetPremineAmount = baseMaxSupply / 5
+	TestnetPremineAmount = MaxMoneyValue / 5
 )
 
 var (
 	// Hardcoded burn marker script for trackable burns/premine accounting.
 	// NOTE: Script spend rules are not enforced yet in this codebase.
-	testnetBurnScript = []byte("burn:testnet:premine:v1")
+	TestnetBurnScript = []byte("burn:testnet:premine:v1")
 )
 
 // Mainnet is the primary fairchain network.
 // Economic parameters are aligned with Bitcoin mainnet.
 var Mainnet = &ChainParams{
 	Name:         "mainnet",
+	DataDirName:  "",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x01},
 	DefaultPort:  19333,
 	AddressPrefix: 0x00,
@@ -85,6 +87,8 @@ var Mainnet = &ChainParams{
 
 	CoinbaseMaturity: 100,
 
+	MaxReorgDepth: 288,
+
 	MaxMempoolSize: 5000,
 	MinRelayTxFee:  1000,
 
@@ -96,14 +100,15 @@ var Mainnet = &ChainParams{
 // Testnet is the public test network with easier difficulty.
 var Testnet = &ChainParams{
 	Name:         "testnet",
+	DataDirName:  "testnet2",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x02},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
 
 	// Pre-mined genesis block.
 	// Coinbase: "fairchain testnet genesis"
-	// Timestamp: 1773212867 (2026-03-11T07:07:47Z)
-	// Display hash: 000008559ecc2476f6f26b3367f2935d9976f58a6a6cbcff62df26f1f2861097
+	// Timestamp: 1773533803 (2026-03-15T00:16:43Z)
+	// Display hash: 0000000a561f1ca6014fbc5546a2e1070e009efe7a4ea7db47c9842541a506ce
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -114,9 +119,9 @@ var Testnet = &ChainParams{
 				0xe4, 0x3b, 0xd0, 0x3f, 0xe6, 0x0b, 0x4e, 0x08,
 				0x19, 0x0a, 0xf5, 0x44, 0x52, 0xce, 0xd2, 0x3a,
 			},
-			Timestamp: 1773212867,
-			Bits:      0x1e0fffff,
-			Nonce:     912710,
+			Timestamp: 1773533803,
+			Bits:      0x1e07ffff,
+			Nonce:     3715263,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -131,28 +136,28 @@ var Testnet = &ChainParams{
 					PkScript: []byte{0x00},
 				},
 				{
-					Value:    testnetPremineAmount,
-					PkScript: testnetBurnScript,
+					Value:    TestnetPremineAmount,
+					PkScript: TestnetBurnScript,
 				},
 			},
 			LockTime: 0,
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x97, 0x10, 0x86, 0xf2, 0xf1, 0x26, 0xdf, 0x62,
-		0xff, 0xbc, 0x6c, 0x6a, 0x8a, 0xf5, 0x76, 0x99,
-		0x5d, 0x93, 0xf2, 0x67, 0x33, 0x6b, 0xf2, 0xf6,
-		0x76, 0x24, 0xcc, 0x9e, 0x55, 0x08, 0x00, 0x00,
+		0xce, 0x06, 0xa5, 0x41, 0x25, 0x84, 0xc9, 0x47,
+		0xdb, 0xa7, 0x4e, 0x7a, 0xfe, 0x9e, 0x00, 0x0e,
+		0x07, 0xe1, 0xa2, 0x46, 0x55, 0xbc, 0x4f, 0x01,
+		0xa6, 0x1c, 0x1f, 0x56, 0x0a, 0x00, 0x00, 0x00,
 	},
 
 	TargetBlockSpacing:  5 * time.Second,
 	RetargetInterval:    20,
-	TargetTimespan:      20 * 5 * time.Second, // 100s
+	TargetTimespan:      20 * 5 * time.Second, // 20 blocks × 5s
 	MaxTimeFutureDrift:  2 * time.Minute,
 	MinTimestampRule:    "median-11",
 
-	InitialBits:      0x1e0fffff,
-	MinBits:          0x1e0fffff,
+	InitialBits:      0x1e07ffff, // ~2x harder than minimum (50x easier than previous 100x)
+	MinBits:          0x1e0fffff,  // Minimum difficulty (same as mainnet)
 	NoRetarget:       false,
 
 	MaxBlockSize:     2_000_000,
@@ -168,6 +173,8 @@ var Testnet = &ChainParams{
 
 	CoinbaseMaturity: 10,
 
+	MaxReorgDepth: 1000,
+
 	MaxMempoolSize: 5000,
 	MinRelayTxFee:  100,
 
@@ -182,6 +189,7 @@ var Testnet = &ChainParams{
 // Regtest is a local regression-test network with trivial difficulty and no retarget.
 var Regtest = &ChainParams{
 	Name:         "regtest",
+	DataDirName:  "regtest",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0xFF},
 	DefaultPort:  19444,
 	AddressPrefix: 0x6F,
@@ -204,6 +212,8 @@ var Regtest = &ChainParams{
 	SubsidyHalvingInterval:  150,
 
 	CoinbaseMaturity: 1,
+
+	MaxReorgDepth: 0,
 
 	MaxMempoolSize: 10000,
 	MinRelayTxFee:  0,

@@ -40,6 +40,10 @@ var ErrSideChain = errors.New("side chain block")
 // stored in the orphan pool and will be processed when its parent arrives.
 var ErrOrphanBlock = errors.New("orphan block")
 
+// ErrReorgTooDeep is returned when a reorg exceeds MaxReorgDepth. The
+// competing chain is stored as a side chain but not activated.
+var ErrReorgTooDeep = errors.New("reorg exceeds maximum depth")
+
 // TimeSource provides network-adjusted time. Implementations should return a
 // Unix timestamp that accounts for the median clock offset of connected peers,
 // matching Bitcoin Core's GetAdjustedTime().
@@ -172,13 +176,16 @@ func (c *Chain) Init() error {
 
 			c.tipHash = bestBlock
 			c.tipHeight = bestBlockHeight
-			if err := c.store.PutChainTip(bestBlock, bestBlockHeight); err != nil {
-				return fmt.Errorf("advance chain tip to chainstate: %w", err)
-			}
-			count, _ := c.store.UtxoCount()
-			logging.L.Info("chain tip advanced to match chainstate", "component", "chain",
-				"height", bestBlockHeight, "utxos", count)
-			return nil
+		if err := c.store.PutChainTip(bestBlock, bestBlockHeight); err != nil {
+			return fmt.Errorf("advance chain tip to chainstate: %w", err)
+		}
+		if err := c.loadUtxoSetFromChainstate(); err != nil {
+			logging.L.Warn("failed to load UTXO set after tip advance, rebuilding", "component", "chain", "error", err)
+			return c.rebuildUtxoSet()
+		}
+		logging.L.Info("chain tip advanced to match chainstate", "component", "chain",
+			"height", bestBlockHeight, "utxos", c.utxoSet.Count())
+		return nil
 		}
 
 		logging.L.Warn("chainstate tip mismatch, rebuilding UTXO set", "component", "chain",
@@ -186,11 +193,27 @@ func (c *Chain) Init() error {
 		return c.rebuildUtxoSet()
 	}
 
-	// Chainstate is consistent — load UTXO count for logging.
-	count, _ := c.store.UtxoCount()
+	// Chainstate is consistent — load UTXOs into in-memory set.
+	if err := c.loadUtxoSetFromChainstate(); err != nil {
+		logging.L.Warn("failed to load UTXO set from chainstate, rebuilding", "component", "chain", "error", err)
+		return c.rebuildUtxoSet()
+	}
 	logging.L.Info("chain loaded from persistent storage", "component", "chain",
-		"height", tipHeight, "utxos", count)
+		"height", tipHeight, "utxos", c.utxoSet.Count())
 	return nil
+}
+
+// loadUtxoSetFromChainstate populates the in-memory UTXO set from the persistent
+// chainstate DB. Called during Init() when chainstate is consistent with the chain tip.
+func (c *Chain) loadUtxoSetFromChainstate() error {
+	return c.store.ForEachUtxo(func(txHash types.Hash, index uint32, data []byte) error {
+		entry, err := utxo.DeserializeUtxoEntry(data)
+		if err != nil {
+			return fmt.Errorf("deserialize UTXO %s:%d: %w", txHash, index, err)
+		}
+		c.utxoSet.Add(txHash, index, entry)
+		return nil
+	})
 }
 
 // rebuildUtxoSet replays all blocks to reconstruct the UTXO set and persist it.
@@ -334,6 +357,72 @@ func (c *Chain) GetAncestor(height uint32) *types.BlockHeader {
 	return h
 }
 
+// GetBlockHeight returns the height of a block on the active chain.
+func (c *Chain) GetBlockHeight(hash types.Hash) (uint32, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	height, ok := c.heightByHash[hash]
+	if !ok {
+		return 0, fmt.Errorf("block %s not on active chain", hash.ReverseString())
+	}
+	return height, nil
+}
+
+// BlockLocator returns a list of block hashes from the tip of the active chain,
+// spaced exponentially like Bitcoin Core's CChain::GetLocator(). The result is:
+// tip, tip-1, tip-2, tip-4, tip-8, ..., genesis. This allows a peer to find the
+// highest common block even when chains have diverged significantly.
+func (c *Chain) BlockLocator() []types.Hash {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var locator []types.Hash
+	step := uint32(1)
+	height := c.tipHeight
+
+	for {
+		hash, ok := c.hashByHeight[height]
+		if !ok {
+			break
+		}
+		locator = append(locator, hash)
+
+		if height == 0 {
+			break
+		}
+
+		if height < step {
+			height = 0
+		} else {
+			height -= step
+		}
+
+		// After the first 10 entries (which are consecutive), start doubling
+		// the step size. This matches Bitcoin Core's locator construction.
+		if len(locator) > 10 {
+			step *= 2
+		}
+	}
+
+	return locator
+}
+
+// FindMainChainHash checks if a hash is on the active main chain and returns
+// its height. Returns (height, true) if found, (0, false) otherwise.
+func (c *Chain) FindMainChainHash(hash types.Hash) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	height, ok := c.heightByHash[hash]
+	if !ok {
+		return 0, false
+	}
+	mainHash, exists := c.hashByHeight[height]
+	if !exists || mainHash != hash {
+		return 0, false
+	}
+	return height, true
+}
+
 func (c *Chain) HasBlock(hash types.Hash) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -365,6 +454,14 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 
 	blockHash := crypto.HashBlockHeader(&block.Header)
 
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] chain.ProcessBlock enter",
+			"hash", blockHash.ReverseString()[:16],
+			"parent", block.Header.PrevBlock.ReverseString()[:16],
+			"tip", c.tipHash.ReverseString()[:16],
+			"tip_height", c.tipHeight)
+	}
+
 	if _, ok := c.heightByHash[blockHash]; ok {
 		metrics.Global.BlocksRejected.Add(1)
 		return 0, fmt.Errorf("block %s already in chain", blockHash)
@@ -376,12 +473,29 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 
 	parentHeight, parentKnown := c.heightByHash[block.Header.PrevBlock]
 	if !parentKnown {
+		// Lightweight PoW sanity check before accepting into the orphan pool.
+		// We can't verify the difficulty is correct (unknown parent), but we
+		// can verify the header hash meets its own declared target. This
+		// prevents zero-cost orphan flooding since the attacker must perform
+		// real PoW for every orphan they submit.
+		orphanHash := crypto.HashBlockHeader(&block.Header)
+		if err := crypto.ValidateProofOfWork(orphanHash, block.Header.Bits); err != nil {
+			metrics.Global.BlocksRejected.Add(1)
+			return 0, fmt.Errorf("orphan PoW check failed: %w", err)
+		}
+
 		c.evictExpiredOrphans()
 		if len(c.orphans) >= MaxOrphanBlocks {
 			c.evictRandomOrphan()
 		}
 		c.orphans[blockHash] = &orphanBlock{block: block, addedAt: time.Now()}
 		metrics.Global.OrphansReceived.Add(1)
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] chain.ProcessBlock → orphan",
+				"hash", blockHash.ReverseString()[:16],
+				"parent", block.Header.PrevBlock.ReverseString()[:16],
+				"orphan_pool_size", len(c.orphans))
+		}
 		return 0, fmt.Errorf("%w: %s (parent %s unknown)", ErrOrphanBlock, blockHash, block.Header.PrevBlock)
 	}
 
@@ -476,12 +590,33 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 			return 0, err
 		}
 		metrics.Global.BlocksAccepted.Add(1)
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] chain.ProcessBlock → extend main chain",
+				"hash", blockHash.ReverseString()[:16],
+				"height", newHeight)
+		}
 
 	} else if newWork.Cmp(c.tipWork) > 0 || (newWork.Cmp(c.tipWork) == 0 && bytes.Compare(blockHash[:], c.tipHash[:]) < 0) {
 		if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] chain.ProcessBlock → REORG triggered",
+				"hash", blockHash.ReverseString()[:16],
+				"new_height", newHeight,
+				"new_work", newWork.Text(16),
+				"old_tip", c.tipHash.ReverseString()[:16],
+				"old_height", c.tipHeight,
+				"old_work", c.tipWork.Text(16))
+		}
 		if err := c.reorg(blockHash, newHeight, newWork); err != nil {
+			if errors.Is(err, ErrReorgTooDeep) {
+				c.heightByHash[blockHash] = newHeight
+				logging.L.Warn("reorg rejected (too deep), storing as side chain",
+					"component", "chain", "hash", blockHash.ReverseString()[:16], "height", newHeight, "error", err)
+				c.processOrphans(blockHash)
+				return newHeight, fmt.Errorf("%w: %s", ErrSideChain, err)
+			}
 			return 0, fmt.Errorf("reorg to %s: %w", blockHash, err)
 		}
 		metrics.Global.BlocksAccepted.Add(1)
@@ -490,6 +625,13 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
 		c.heightByHash[blockHash] = newHeight
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] chain.ProcessBlock → side chain (insufficient work)",
+				"hash", blockHash.ReverseString()[:16],
+				"height", newHeight,
+				"block_work", newWork.Text(16),
+				"tip_work", c.tipWork.Text(16))
+		}
 		c.processOrphans(blockHash)
 		return newHeight, fmt.Errorf("%w: block %s at height %d (insufficient work)", ErrSideChain, blockHash, newHeight)
 	}
@@ -509,7 +651,7 @@ func (c *Chain) persistUtxoChanges(block *types.Block, undoData *utxo.BlockUndoD
 	for _, tx := range block.Transactions {
 		txHash, err := crypto.HashTransaction(&tx)
 		if err != nil {
-			continue
+			return fmt.Errorf("hash tx during UTXO persist: %w", err)
 		}
 		for i := range tx.Outputs {
 			entry := c.utxoSet.Get(txHash, uint32(i))
@@ -537,7 +679,7 @@ func (c *Chain) persistUtxoDisconnect(block *types.Block, undoData *utxo.BlockUn
 	for _, tx := range block.Transactions {
 		txHash, err := crypto.HashTransaction(&tx)
 		if err != nil {
-			continue
+			return fmt.Errorf("hash tx during UTXO disconnect persist: %w", err)
 		}
 		for i := range tx.Outputs {
 			wb.DeleteUtxo(txHash, uint32(i))
@@ -618,9 +760,24 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 
 	oldTipHeight := c.tipHeight
 	reorgDepth := oldTipHeight - forkParentHeight
+
+	if c.params.MaxReorgDepth > 0 && reorgDepth > c.params.MaxReorgDepth {
+		return fmt.Errorf("%w: depth %d exceeds limit %d (fork at height %d)",
+			ErrReorgTooDeep, reorgDepth, c.params.MaxReorgDepth, forkParentHeight)
+	}
+
 	logging.L.Warn("chain reorg", "component", "chain", "fork_height", forkParentHeight, "old_tip", oldTipHeight, "new_tip", newTipHeight, "depth", reorgDepth)
 	metrics.Global.Reorgs.Add(1)
 	metrics.Global.ReorgDepthTotal.Add(uint64(reorgDepth))
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg detail",
+			"old_tip_hash", c.tipHash.ReverseString()[:16],
+			"new_tip_hash", newTipHash.ReverseString()[:16],
+			"fork_height", forkParentHeight,
+			"disconnect_count", reorgDepth,
+			"connect_count", len(newChain))
+	}
 
 	// Disconnect old main chain blocks (UTXO rollback).
 	// Each disconnect is flushed to chainstate incrementally so a crash
@@ -748,6 +905,8 @@ func cloneUtxoSet(src *utxo.Set) *utxo.Set {
 		copy(txHash[:], key[:32])
 		index := binary.LittleEndian.Uint32(key[32:])
 		entryCopy := *entry
+		entryCopy.PkScript = make([]byte, len(entry.PkScript))
+		copy(entryCopy.PkScript, entry.PkScript)
 		dst.Add(txHash, index, &entryCopy)
 	}
 	return dst
@@ -792,6 +951,13 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 				toProcess = append(toProcess, orphanEntry{hash: hash, block: ob.block})
 				delete(c.orphans, hash)
 			}
+		}
+
+		if logging.DebugMode && len(toProcess) > 0 {
+			logging.L.Debug("[dbg] processOrphans",
+				"parent", parent.ReverseString()[:16],
+				"candidates", len(toProcess),
+				"remaining_orphans", len(c.orphans))
 		}
 
 		sort.Slice(toProcess, func(i, j int) bool {
@@ -890,11 +1056,15 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 				_ = c.store.PutBlockIndex(blockHash, rec)
 				c.heightByHash[blockHash] = newHeight
 				if err := c.reorg(blockHash, newHeight, newWork); err != nil {
-					delete(c.heightByHash, blockHash)
+					if !errors.Is(err, ErrReorgTooDeep) {
+						delete(c.heightByHash, blockHash)
+					}
 					logging.L.Warn("orphan reorg failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 					continue
 				}
 				logging.L.Info("reorg from orphan resolution", "component", "chain", "hash", blockHash.ReverseString(), "height", newHeight)
+				queue = []types.Hash{blockHash}
+				break
 			} else {
 				_ = c.store.PutBlockIndex(blockHash, rec)
 				c.heightByHash[blockHash] = newHeight

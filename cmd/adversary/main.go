@@ -104,19 +104,23 @@ type blockInfo struct {
 	Hash      string `json:"hash"`
 	Height    int    `json:"height"`
 	Version   uint32 `json:"version"`
-	PrevBlock string `json:"prev_block"`
-	Merkle    string `json:"merkle_root"`
-	Timestamp uint32 `json:"timestamp"`
+	PrevBlock string `json:"previousblockhash"`
+	Merkle    string `json:"merkleroot"`
+	Timestamp uint32 `json:"time"`
 	Bits      string `json:"bits"`
 	Nonce     uint32 `json:"nonce"`
-	TxCount   int    `json:"tx_count"`
+	TxCount   int    `json:"nTx"`
 }
 
 type chainInfo struct {
-	Height           int    `json:"blocks"`
-	BestHash         string `json:"best_block_hash"`
+	Height   int    `json:"blocks"`
+	BestHash string `json:"bestblockhash"`
+	Bits     string `json:"bits"`
+	Chain    string `json:"chain"`
+}
+
+type chainStatus struct {
 	Bits             string `json:"bits"`
-	Chain            string `json:"chain"`
 	RetargetInterval uint32 `json:"retarget_interval"`
 }
 
@@ -131,6 +135,49 @@ func fetchChainInfo(rpc string) (*chainInfo, error) {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func fetchChainStatus(rpc string) (*chainStatus, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/getchainstatus", rpc))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var status chainStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+type fullChainInfo struct {
+	Height           int
+	BestHash         string
+	Bits             string
+	Chain            string
+	RetargetInterval uint32
+}
+
+func fetchFullChainInfo(rpc string) (*fullChainInfo, error) {
+	ci, err := fetchChainInfo(rpc)
+	if err != nil {
+		return nil, fmt.Errorf("fetch chain info: %w", err)
+	}
+	cs, err := fetchChainStatus(rpc)
+	if err != nil {
+		return nil, fmt.Errorf("fetch chain status: %w", err)
+	}
+	bits := ci.Bits
+	if bits == "" {
+		bits = cs.Bits
+	}
+	return &fullChainInfo{
+		Height:           ci.Height,
+		BestHash:         ci.BestHash,
+		Bits:             bits,
+		Chain:            ci.Chain,
+		RetargetInterval: cs.RetargetInterval,
+	}, nil
 }
 
 func submitBlock(rpc string, block *types.Block) (bool, string) {
@@ -159,7 +206,7 @@ func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  heightBytes,
+			SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{
@@ -171,9 +218,9 @@ func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
 }
 
 func buildBlockOnTip(rpc string) (*types.Block, uint32, error) {
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
-		return nil, 0, fmt.Errorf("fetch chain info: %w", err)
+		return nil, 0, err
 	}
 
 	prevHash, err := types.HashFromReverseHex(ci.BestHash)
@@ -372,7 +419,7 @@ func attackInflatedCoinbase(rpc string) ([]attackResult, error) {
 
 // Attack 7: Block with zero transactions (no coinbase)
 func attackEmptyBlock(rpc string) ([]attackResult, error) {
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +449,7 @@ func attackEmptyBlock(rpc string) ([]attackResult, error) {
 
 // Attack 8: Block with artificially easy difficulty bits (should be rejected by bits validation)
 func attackWrongBits(rpc string) ([]attackResult, error) {
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -450,9 +497,9 @@ func attackWrongBits(rpc string) ([]attackResult, error) {
 // a coinbase and a spend transaction. The spend tx references the given outpoint
 // and sends outputValue to a dummy script. The block is mined with valid PoW.
 func buildBlockWithSpendTx(rpc string, spendTxHash types.Hash, spendIndex uint32, outputValue uint64, tag string) (*types.Block, uint32, error) {
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
-		return nil, 0, fmt.Errorf("fetch chain info: %w", err)
+		return nil, 0, err
 	}
 
 	prevHash, err := types.HashFromReverseHex(ci.BestHash)
@@ -559,13 +606,13 @@ func findSpendableUTXO(rpc string, mustBeMature bool) (string, uint32, uint64, e
 		heightBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(heightBytes, uint32(h))
 
-		// Try the standard miner coinbase format: height + "fairchain"
+		// Try the standard miner coinbase format: BIP34 (0x04 + height) + suffix
 		for _, suffix := range []string{"fairchain", "test", ""} {
 			cb := types.Transaction{
 				Version: 1,
 				Inputs: []types.TxInput{{
 					PreviousOutPoint: types.CoinbaseOutPoint,
-					SignatureScript:  append(heightBytes, []byte(suffix)...),
+					SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte(suffix)...),
 					Sequence:         0xFFFFFFFF,
 				}},
 				Outputs: []types.TxOutput{{
@@ -613,7 +660,7 @@ func findImmatureUTXO(rpc string) (string, uint32, uint64, error) {
 				Version: 1,
 				Inputs: []types.TxInput{{
 					PreviousOutPoint: types.CoinbaseOutPoint,
-					SignatureScript:  append(heightBytes, []byte(suffix)...),
+					SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte(suffix)...),
 					Sequence:         0xFFFFFFFF,
 				}},
 				Outputs: []types.TxOutput{{
@@ -681,7 +728,7 @@ func attackImmatureCoinbaseSpend(rpc string) ([]attackResult, error) {
 			Version: 1,
 			Inputs: []types.TxInput{{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  append(heightBytes, []byte("fairchain")...),
+				SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...),
 				Sequence:         0xFFFFFFFF,
 			}},
 			Outputs: []types.TxOutput{{
@@ -781,9 +828,9 @@ func attackDuplicateInput(rpc string) ([]attackResult, error) {
 
 	txHash, _ := types.HashFromReverseHex(txidDisplay)
 
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
-		return nil, fmt.Errorf("fetch chain info: %w", err)
+		return nil, err
 	}
 
 	prevHash, _ := types.HashFromReverseHex(ci.BestHash)
@@ -858,9 +905,9 @@ func attackIntraBlockDoubleSpend(rpc string) ([]attackResult, error) {
 
 	txHash, _ := types.HashFromReverseHex(txidDisplay)
 
-	ci, err := fetchChainInfo(rpc)
+	ci, err := fetchFullChainInfo(rpc)
 	if err != nil {
-		return nil, fmt.Errorf("fetch chain info: %w", err)
+		return nil, err
 	}
 
 	prevHash, _ := types.HashFromReverseHex(ci.BestHash)
@@ -987,7 +1034,7 @@ func findMinerCoinbaseUTXO(rpc string, mature bool) (types.Hash, uint32, uint64,
 	for h := startHeight; h >= 1; h-- {
 		heightBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(heightBytes, uint32(h))
-		msg := append(heightBytes, []byte("fairchain")...)
+		msg := append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...)
 
 		cb := types.Transaction{
 			Version: 1,
@@ -1045,7 +1092,7 @@ func attackStealUTXO(rpc string) ([]attackResult, error) {
 			continue
 		}
 
-		ci, err := fetchChainInfo(rpc)
+		ci, err := fetchFullChainInfo(rpc)
 		if err != nil {
 			continue
 		}
@@ -1170,7 +1217,7 @@ func attackStealPremine(rpc string) ([]attackResult, error) {
 			outputIdx = 0
 		}
 
-		ci, err := fetchChainInfo(rpc)
+		ci, err := fetchFullChainInfo(rpc)
 		if err != nil {
 			continue
 		}
@@ -1265,13 +1312,13 @@ func attackDifficultyManipulation(rpc string, epochs int) ([]attackResult, error
 	var results []attackResult
 
 	for epoch := 0; epoch < epochs; epoch++ {
-		ci, err := fetchChainInfo(rpc)
+		ci, err := fetchFullChainInfo(rpc)
 		if err != nil {
-			return results, fmt.Errorf("fetch chain info: %w", err)
+			return results, err
 		}
 
 		currentHeight := uint32(ci.Height)
-		retargetInterval := uint32(ci.RetargetInterval)
+		retargetInterval := ci.RetargetInterval
 		if retargetInterval == 0 {
 			retargetInterval = 20
 		}
@@ -1367,18 +1414,18 @@ func attackDifficultyManipulation(rpc string, epochs int) ([]attackResult, error
 
 			if newHeight%retargetInterval == 0 {
 				time.Sleep(100 * time.Millisecond)
-				newCi, ciErr := fetchChainInfo(rpc)
-				if ciErr == nil {
-					fmt.Sscanf(newCi.Bits, "%x", &bits)
+				newCs, csErr := fetchChainStatus(rpc)
+				if csErr == nil {
+					fmt.Sscanf(newCs.Bits, "%x", &bits)
 				}
 			}
 		}
 
 		time.Sleep(200 * time.Millisecond)
-		newCi, _ := fetchChainInfo(rpc)
+		newCs, _ := fetchChainStatus(rpc)
 		newBitsStr := "unknown"
-		if newCi != nil {
-			newBitsStr = newCi.Bits
+		if newCs != nil {
+			newBitsStr = newCs.Bits
 		}
 
 		results = append(results, attackResult{
