@@ -49,6 +49,12 @@ func TestPeerPingPong(t *testing.T) {
 	nonce := uint64(12345)
 	p.SetPingNonce(nonce)
 
+	// Nudge pingSent into the past so time.Since always returns > 0,
+	// even on Windows where the timer granularity can be ~15ms.
+	p.mu.Lock()
+	p.pingSent = p.pingSent.Add(-time.Millisecond)
+	p.mu.Unlock()
+
 	if p.PongOverdue() {
 		t.Fatal("pong should not be overdue immediately after ping")
 	}
